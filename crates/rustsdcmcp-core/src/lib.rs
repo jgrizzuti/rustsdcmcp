@@ -9,6 +9,7 @@ mod client;
 mod config;
 mod device_sync;
 mod firewall_write;
+mod ips_write;
 mod license_write;
 mod models;
 mod nat_write;
@@ -36,6 +37,10 @@ pub use device_sync::{
 pub use firewall_write::{
     FirewallApplyResult, FirewallPrepareResult, FirewallValidationReport, FirewallWriteOperation,
     SdcFirewallTransaction, SdcPreparedFirewallWrite,
+};
+pub use ips_write::{
+    IpsApplyResult, IpsPrepareResult, IpsValidationReport, IpsWriteAction, IpsWriteFamily,
+    SdcIpsTransaction, SdcPreparedIpsWrite,
 };
 pub use license_write::{
     LicenseApplyResult, LicensePrepareResult, LicenseValidationReport, LicenseWriteOperation,

@@ -1,10 +1,11 @@
 //! SDC adapter for the shared preview-bound, two-person change lifecycle.
 
 use crate::{
-    DeployRequest, JobStatus, NatValidationReport, NatWriteOperation, ObjectValidationReport,
-    ObjectWriteAction, PolicyOperation, SdcClient, SdcError, SdcNatTransaction,
-    SdcObjectTransaction, SdcPreparedChange, SdcPreparedNatWrite, SdcPreparedObjectWrite,
-    WritableResource,
+    DeployRequest, IpsApplyResult, IpsPrepareResult, IpsWriteAction, IpsWriteFamily, JobStatus,
+    NatValidationReport, NatWriteOperation, ObjectValidationReport, ObjectWriteAction,
+    PolicyOperation, SdcClient, SdcError, SdcIpsTransaction, SdcNatTransaction,
+    SdcObjectTransaction, SdcPreparedChange, SdcPreparedIpsWrite, SdcPreparedNatWrite,
+    SdcPreparedObjectWrite, WritableResource,
 };
 use async_trait::async_trait;
 use mecmcp_audit::Attribution;
@@ -27,6 +28,8 @@ use tokio_util::sync::CancellationToken;
 pub enum ChangeKind {
     /// Object create/update/delete write.
     ObjectWrite,
+    /// IPS signature or profile create/update write.
+    IpsWrite,
     /// Firewall policy write.
     FirewallWrite,
     /// Firewall policy rule write.
@@ -338,6 +341,7 @@ pub struct ChangeManager {
     endpoint: String,
     policy_signature: String,
     object_signature: String,
+    ips_signature: String,
     nat_signature: String,
     firewall_rule_signature: String,
     license_signature: String,
@@ -378,6 +382,8 @@ impl ChangeManager {
             mutation_policy_signature(format!("sdc-policy-deploy-v1:{tenant}:{endpoint}"));
         let object_signature =
             mutation_policy_signature(format!("sdc-object-write-v1:{tenant}:{endpoint}"));
+        let ips_signature =
+            mutation_policy_signature(format!("sdc-ips-write-v1:{tenant}:{endpoint}"));
         let nat_signature =
             mutation_policy_signature(format!("sdc-nat-write-v1:{tenant}:{endpoint}"));
         let firewall_rule_signature =
@@ -405,6 +411,7 @@ impl ChangeManager {
             endpoint,
             policy_signature,
             object_signature,
+            ips_signature,
             nat_signature,
             firewall_rule_signature,
             license_signature,
@@ -619,6 +626,216 @@ impl ChangeManager {
             }
         };
         Ok(ObjectApplyResult {
+            operation_id,
+            plan,
+            validation,
+            outcome,
+        })
+    }
+
+    /// Resolve an IPS signature's or profile's current state and create its
+    /// digest-bound plan.
+    ///
+    /// Create carries no prior state; update reads the live object so the plan
+    /// records exactly what the write would replace, and so the predefined-
+    /// signature guard sees the target's real origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target cannot be read, the envelope or an IPS
+    /// guard refuses it, or change-control state cannot be written.
+    pub async fn prepare_ips_write(
+        &self,
+        owner: String,
+        action: IpsWriteAction,
+        family: IpsWriteFamily,
+        uuid: Option<String>,
+        request: Value,
+        cancellation: &CancellationToken,
+    ) -> Result<IpsPrepareResult, SdcError> {
+        let before = match (action, uuid.as_deref()) {
+            (IpsWriteAction::Create, None) => Value::Null,
+            (IpsWriteAction::Create, Some(_)) => {
+                return Err(SdcError::InvalidInput(
+                    "create must not name a target UUID; SDC allocates it",
+                ));
+            }
+            (IpsWriteAction::Update, Some(identifier)) => {
+                self.client
+                    .get_resource(family.resource_kind(), identifier, cancellation)
+                    .await?
+            }
+            (IpsWriteAction::Update, None) => {
+                return Err(SdcError::InvalidInput("update requires the target UUID"));
+            }
+        };
+        let prepared = SdcPreparedIpsWrite::new(action, family, uuid, request, before)?;
+        let change_set = self
+            .coordinator
+            .create_change_set(
+                self.tenant.clone(),
+                vec![prepared.clone()],
+                owner.clone(),
+                prepared.plan_digest().to_owned(),
+                self.ips_signature.clone(),
+                None,
+            )
+            .await
+            .map_err(|error| SdcError::ChangeControl(error.to_string()))?;
+        let change_set = self
+            .waive_if_lab_mode(change_set, &owner, ChangeKind::IpsWrite)
+            .await?;
+        Ok(IpsPrepareResult {
+            change_set,
+            prepared_change: prepared,
+        })
+    }
+
+    /// Discard an IPS write that failed before anything was sent to SDC.
+    async fn release_unwritten_ips(
+        &self,
+        operation_id: &str,
+        owner: &str,
+        expected_plan_digest: &str,
+        transaction: &SdcIpsTransaction,
+        cancellation: &CancellationToken,
+    ) -> String {
+        match self
+            .coordinator
+            .discard_operation(
+                operation_id,
+                &self.tenant,
+                owner,
+                expected_plan_digest,
+                transaction,
+                cancellation,
+            )
+            .await
+        {
+            Ok(_) => "the planned write was discarded".to_owned(),
+            Err(discard_error) => format!(
+                "the planned write also could not be discarded and needs manual resolution: {discard_error}"
+            ),
+        }
+    }
+
+    /// Apply, diff, drift-check, and commit one exact approved IPS write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when approval does not match, the target drifted since
+    /// prepare, an IPS guard refuses the persisted plan, or the SDC write fails.
+    pub async fn apply_ips_write(
+        &self,
+        change_set_id: String,
+        owner: String,
+        expected_digest: String,
+        expected_plan_digest: String,
+        attribution: &Attribution,
+        cancellation: &CancellationToken,
+    ) -> Result<IpsApplyResult, SdcError> {
+        let transaction = SdcIpsTransaction::new(
+            self.client.clone(),
+            expected_plan_digest.clone(),
+            cancellation.clone(),
+        );
+        let applied = self
+            .coordinator
+            .apply_change_set(
+                change_set_id,
+                self.tenant.clone(),
+                self.endpoint.clone(),
+                owner.clone(),
+                expected_digest,
+                expected_plan_digest.clone(),
+                &transaction,
+                "ips_write",
+                None,
+                None,
+                attribution,
+                cancellation,
+            )
+            .await
+            .map_err(|error| SdcError::ChangeControl(error.to_string()))?;
+        let operation_id = applied.operation_id;
+        let staged = applied.staged;
+        let plan = self
+            .coordinator
+            .diff_operation(
+                &operation_id,
+                &self.tenant,
+                &owner,
+                &expected_plan_digest,
+                &transaction,
+                &staged,
+                cancellation,
+            )
+            .await
+            .map_err(|error| SdcError::ChangeControl(error.to_string()))?;
+        let validation = match self
+            .coordinator
+            .validate_operation(
+                &operation_id,
+                &self.tenant,
+                &owner,
+                &expected_plan_digest,
+                &transaction,
+                &staged,
+                cancellation,
+            )
+            .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                // Staging and validation only read, so nothing was written and
+                // discarding the non-terminal `Failed` record is truthful.
+                let detail = self
+                    .release_unwritten_ips(
+                        &operation_id,
+                        &owner,
+                        &expected_plan_digest,
+                        &transaction,
+                        cancellation,
+                    )
+                    .await;
+                return Err(SdcError::ChangeControl(format!("{error}; {detail}")));
+            }
+        };
+        let outcome = match self
+            .coordinator
+            .commit_operation(
+                &operation_id,
+                &self.tenant,
+                &owner,
+                &expected_plan_digest,
+                &self.ips_signature,
+                &transaction,
+                &staged,
+                attribution,
+                &CommitOptions::default(),
+                cancellation,
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Only a refusal before anything was sent is safe to discard.
+                if !transaction.refused_before_write() {
+                    return Err(SdcError::ChangeControl(error.to_string()));
+                }
+                let detail = self
+                    .release_unwritten_ips(
+                        &operation_id,
+                        &owner,
+                        &expected_plan_digest,
+                        &transaction,
+                        cancellation,
+                    )
+                    .await;
+                return Err(SdcError::ChangeControl(format!("{error}; {detail}")));
+            }
+        };
+        Ok(IpsApplyResult {
             operation_id,
             plan,
             validation,
@@ -2691,6 +2908,7 @@ mod tests {
     #[test]
     fn only_oob_kinds_refuse_the_lab_mode_waiver() {
         assert!(ChangeKind::ObjectWrite.allows_lab_mode_waiver());
+        assert!(ChangeKind::IpsWrite.allows_lab_mode_waiver());
         assert!(ChangeKind::FirewallWrite.allows_lab_mode_waiver());
         assert!(ChangeKind::LicenseWrite.allows_lab_mode_waiver());
         assert!(ChangeKind::NatWrite.allows_lab_mode_waiver());

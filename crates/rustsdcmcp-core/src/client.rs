@@ -1375,6 +1375,52 @@ impl SdcClient {
             .await
     }
 
+    /// Create one custom IPS signature or IPS profile.
+    ///
+    /// Takes [`crate::IpsWriteFamily`], not [`ResourceKind`], for the same
+    /// reason [`Self::create_resource`] takes [`WritableResource`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the body is not a bounded JSON object, or when
+    /// the SDC request fails.
+    pub async fn create_ips_object(
+        &self,
+        family: crate::IpsWriteFamily,
+        body: &Value,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, SdcError> {
+        validate_object_body(body)?;
+        self.send_write(
+            Method::POST,
+            family.collection_segments(),
+            Some(body),
+            cancellation,
+        )
+        .await
+    }
+
+    /// Replace one custom IPS signature or IPS profile by UUID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the UUID or body is invalid, or when the SDC
+    /// request fails.
+    pub async fn update_ips_object(
+        &self,
+        family: crate::IpsWriteFamily,
+        uuid: &str,
+        body: &Value,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, SdcError> {
+        validate_atom("uuid", uuid)?;
+        validate_object_body(body)?;
+        let mut segments = family.collection_segments().to_vec();
+        segments.push(uuid);
+        self.send_write(Method::PUT, &segments, Some(body), cancellation)
+            .await
+    }
+
     /// List IPsec profiles with bounded pagination.
     ///
     /// This is a `/api/v2/` endpoint, unlike most policy and device operations.
