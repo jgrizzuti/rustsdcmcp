@@ -840,6 +840,7 @@ impl ChangeManager {
             plan,
             validation,
             outcome,
+            created_uuid: transaction.created_uuid(),
         })
     }
 

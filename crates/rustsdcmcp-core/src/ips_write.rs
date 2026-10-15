@@ -30,7 +30,7 @@ use mecmcp_changeset::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use tokio_util::sync::CancellationToken;
@@ -310,6 +310,20 @@ fn is_predefined_signature(before: &Value) -> bool {
         .is_some_and(|import_id| !import_id.trim().is_empty())
 }
 
+/// The UUID SDC allocated, read from a create response.
+///
+/// The spec documents both creates as returning the new object (`IpsSignature`
+/// / `IpsProfile`, which carry `uuid`). A missing, empty, or non-string `uuid`
+/// yields `None` rather than an error, because the write itself succeeded.
+fn created_uuid_from(response: &Value) -> Option<String> {
+    response
+        .get("uuid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|uuid| !uuid.is_empty())
+        .map(str::to_owned)
+}
+
 /// The spec's `IpsProfileInput.name` format: `^[^#&;\r\n ]{1,127}$`.
 fn is_valid_profile_name(name: &str) -> bool {
     let length = name.chars().count();
@@ -365,6 +379,10 @@ pub struct IpsApplyResult {
     pub validation: IpsValidationReport,
     /// Known, detached, or indeterminate commit disposition.
     pub outcome: CommitOutcome,
+    /// UUID SDC allocated for a successful create, so a follow-up update can
+    /// address it without searching the collection. `None` for update, and
+    /// for a create whose response carried no UUID.
+    pub created_uuid: Option<String>,
 }
 
 /// SDC implementation of the shared transaction contract for IPS writes.
@@ -374,6 +392,7 @@ pub struct SdcIpsTransaction {
     expected_plan_digest: String,
     cancellation: CancellationToken,
     refused_before_write: Arc<AtomicBool>,
+    created_uuid: Arc<OnceLock<String>>,
 }
 
 impl SdcIpsTransaction {
@@ -389,6 +408,7 @@ impl SdcIpsTransaction {
             expected_plan_digest: expected_plan_digest.into(),
             cancellation,
             refused_before_write: Arc::new(AtomicBool::new(false)),
+            created_uuid: Arc::new(OnceLock::new()),
         }
     }
 
@@ -399,6 +419,15 @@ impl SdcIpsTransaction {
     #[must_use]
     pub fn refused_before_write(&self) -> bool {
         self.refused_before_write.load(Ordering::SeqCst)
+    }
+
+    /// UUID SDC returned for a successful create, if any.
+    ///
+    /// The coordinator's [`CommitOutcome`] has no slot for it, so the
+    /// transaction keeps it for the caller to report.
+    #[must_use]
+    pub fn created_uuid(&self) -> Option<String> {
+        self.created_uuid.get().cloned()
     }
 
     /// Re-read the target and report whether it still matches its plan.
@@ -508,14 +537,27 @@ impl DeviceTransaction for SdcIpsTransaction {
             }
         };
         match result {
-            Ok(_) => Ok(CommitOutcome::Reconciled {
-                succeeded: true,
-                job_id: None,
-                details: Some(format!(
-                    "SDC {} completed; nothing reaches a device until a policy using it is deployed",
-                    staged.action().as_str()
-                )),
-            }),
+            Ok(response) => {
+                let created = (staged.action() == IpsWriteAction::Create)
+                    .then(|| created_uuid_from(&response))
+                    .flatten();
+                let identity = match &created {
+                    Some(uuid) => {
+                        // Set once per transaction; a second commit cannot occur.
+                        let _ = self.created_uuid.set(uuid.clone());
+                        format!(" as {uuid}")
+                    }
+                    None => String::new(),
+                };
+                Ok(CommitOutcome::Reconciled {
+                    succeeded: true,
+                    job_id: None,
+                    details: Some(format!(
+                        "SDC {} completed{identity}; nothing reaches a device until a policy using it is deployed",
+                        staged.action().as_str()
+                    )),
+                })
+            }
             Err(SdcError::Cancelled | SdcError::Timeout | SdcError::MutationOutcomeUnknown) => {
                 Ok(CommitOutcome::Indeterminate {
                     reason: "SDC IPS write was submitted but its outcome was not observed"
@@ -564,7 +606,10 @@ impl DeviceTransaction for SdcIpsTransaction {
 
 #[cfg(test)]
 mod tests {
-    use super::{IpsWriteAction, IpsWriteFamily, SdcPreparedIpsWrite, is_valid_profile_name};
+    use super::{
+        IpsWriteAction, IpsWriteFamily, SdcPreparedIpsWrite, created_uuid_from,
+        is_valid_profile_name,
+    };
     use crate::ResourceKind;
     use serde_json::{Value, json};
 
@@ -775,6 +820,24 @@ mod tests {
         stored["before"]["import_id"] = json!("HTTP:SQL:INJ:COMMENT");
         let tampered: SdcPreparedIpsWrite = serde_json::from_value(stored).expect("deserialize");
         assert!(tampered.validate().is_err());
+    }
+
+    #[test]
+    fn a_create_response_yields_the_allocated_uuid_when_present() {
+        assert_eq!(
+            created_uuid_from(&json!({ "uuid": "8ad65be9-0000", "name": "X" })).as_deref(),
+            Some("8ad65be9-0000")
+        );
+        for response in [
+            Value::Null,
+            json!({}),
+            json!({ "uuid": "" }),
+            json!({ "uuid": "  " }),
+            json!({ "uuid": 42 }),
+            json!([{ "uuid": "nested" }]),
+        ] {
+            assert_eq!(created_uuid_from(&response), None, "{response}");
+        }
     }
 
     #[test]

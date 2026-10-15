@@ -19,6 +19,7 @@ layer was deleted in #36 on the move to mecmcp 0.7.2, and the ledger itself in
   own grant, so an existing object-write or wildcard token does not gain them.
   Updates to predefined signatures (those carrying a signature-bundle
   `import_id`) are refused, and a body may not set `uuid` or `import_id`.
+  A successful create returns the UUID SDC allocated as `created_uuid`.
   Delete, IPS rules, and exempt rules are not included yet. (#266)
 
 ## `v0.3.1` — 2026-10-15
