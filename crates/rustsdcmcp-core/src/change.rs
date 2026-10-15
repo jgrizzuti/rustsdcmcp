@@ -4422,4 +4422,588 @@ mod tests {
         }
         server.abort();
     }
+
+    // ---- IPS writes (#266) -------------------------------------------------
+
+    fn custom_signature(name: &str) -> Value {
+        json!({
+            "uuid": "sig-1",
+            "name": name,
+            "signature_type": "signature",
+            "severity": "Info"
+        })
+    }
+
+    fn ips_update_fixture(before: Value) -> SdcPreparedIpsWrite {
+        SdcPreparedIpsWrite::new(
+            IpsWriteAction::Update,
+            IpsWriteFamily::Signature,
+            Some("sig-1".to_owned()),
+            json!({"name": "CUSTOM-X", "severity": "Minor"}),
+            before,
+        )
+        .expect("prepared IPS write")
+    }
+
+    /// A fake SDC that records every request, serves one mutable signature on
+    /// GET, and answers writes with `write_response` and `write_status`.
+    async fn ips_server(
+        signature: Arc<std::sync::Mutex<Value>>,
+        write_status: axum::http::StatusCode,
+        write_response: Value,
+    ) -> (Url, tokio::task::JoinHandle<()>, Seen) {
+        let seen: Seen = Arc::default();
+        let log = seen.clone();
+        let app = Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
+                let signature = signature.clone();
+                let log = log.clone();
+                let write_response = write_response.clone();
+                async move {
+                    let parsed = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    log.lock().expect("log").push((
+                        method.to_string(),
+                        uri.path().to_owned(),
+                        parsed,
+                    ));
+                    if method == axum::http::Method::GET {
+                        (
+                            axum::http::StatusCode::OK,
+                            Json(signature.lock().expect("signature").clone()),
+                        )
+                    } else {
+                        (write_status, Json(write_response))
+                    }
+                }
+            },
+        );
+        let (url, task) = serve(app).await;
+        (url, task, seen)
+    }
+
+    /// Two-person manager: lab mode off, so every write needs a second human.
+    fn ips_manager(base_url: &Url) -> (ChangeManager, SdcClient) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client =
+            SdcClient::from_test_parts(base_url.as_str(), "test-secret".to_owned(), 64 * 1024, 100);
+        let manager = ChangeManager::load(
+            client.clone(),
+            "tenant-a",
+            base_url.to_string(),
+            None,
+            Duration::from_secs(60),
+            false,
+            None,
+            None,
+        )
+        .expect("change manager");
+        (manager, client)
+    }
+
+    fn writes(seen: &Seen) -> Vec<(String, String, Value)> {
+        seen.lock()
+            .expect("log")
+            .iter()
+            .filter(|(method, _, _)| method != "GET")
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_ips_create_needs_an_independent_human_and_reports_the_new_uuid() {
+        let (base_url, server, seen) = ips_server(
+            Arc::new(std::sync::Mutex::new(Value::Null)),
+            axum::http::StatusCode::OK,
+            json!({"uuid": "sig-new", "name": "CUSTOM-X"}),
+        )
+        .await;
+        let (manager, _) = ips_manager(&base_url);
+        let cancellation = CancellationToken::new();
+        let body = json!({"name": "CUSTOM-X", "signature_type": "signature", "severity": "Info"});
+
+        let prepared = manager
+            .prepare_ips_write(
+                "alice".to_owned(),
+                IpsWriteAction::Create,
+                IpsWriteFamily::Signature,
+                None,
+                body.clone(),
+                &cancellation,
+            )
+            .await
+            .expect("prepare");
+        assert!(prepared.prepared_change.before().is_null());
+        assert!(
+            seen.lock().expect("log").is_empty(),
+            "planning a create must not contact SDC at all"
+        );
+
+        // Neither the owner nor an agent can stand in as the second approver.
+        for (approver, actor) in [
+            ("alice", mecmcp_audit::ActorType::Human),
+            ("bob", mecmcp_audit::ActorType::Agent),
+        ] {
+            assert!(
+                manager
+                    .approve(
+                        prepared.change_set.change_set_id.clone(),
+                        approver.to_owned(),
+                        prepared.change_set.digest.clone(),
+                        actor,
+                    )
+                    .await
+                    .is_err(),
+                "{approver}/{actor:?} must not approve"
+            );
+        }
+        // An unapproved change set must not apply.
+        assert!(
+            manager
+                .apply_ips_write(
+                    prepared.change_set.change_set_id.clone(),
+                    "alice".to_owned(),
+                    prepared.change_set.digest.clone(),
+                    prepared.prepared_change.plan_digest().to_owned(),
+                    &Attribution::stdio(),
+                    &cancellation,
+                )
+                .await
+                .is_err(),
+            "an unapproved IPS write must not apply"
+        );
+        assert!(
+            writes(&seen).is_empty(),
+            "nothing may be sent before approval"
+        );
+
+        manager
+            .approve(
+                prepared.change_set.change_set_id.clone(),
+                "bob".to_owned(),
+                prepared.change_set.digest.clone(),
+                mecmcp_audit::ActorType::Human,
+            )
+            .await
+            .expect("independent human approval");
+        let applied = manager
+            .apply_ips_write(
+                prepared.change_set.change_set_id,
+                "alice".to_owned(),
+                prepared.change_set.digest,
+                prepared.prepared_change.plan_digest().to_owned(),
+                &Attribution::stdio(),
+                &cancellation,
+            )
+            .await
+            .expect("apply");
+
+        assert!(matches!(
+            applied.outcome,
+            CommitOutcome::Reconciled {
+                succeeded: true,
+                ..
+            }
+        ));
+        assert_eq!(applied.created_uuid.as_deref(), Some("sig-new"));
+        let sent = writes(&seen);
+        assert_eq!(sent.len(), 1, "exactly one write: {sent:?}");
+        assert_eq!(sent[0].0, "POST");
+        assert_eq!(sent[0].1, "/api/v1/ips_signatures");
+        assert_eq!(sent[0].2, body, "the approved body is sent verbatim");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_ips_update_binds_the_observed_state_and_puts_the_exact_body() {
+        let signature = Arc::new(std::sync::Mutex::new(custom_signature("CUSTOM-X")));
+        let (base_url, server, seen) = ips_server(
+            signature,
+            axum::http::StatusCode::OK,
+            json!({"uuid": "sig-1"}),
+        )
+        .await;
+        let (manager, _) = ips_manager(&base_url);
+        let cancellation = CancellationToken::new();
+        let body = json!({"name": "CUSTOM-X", "signature_type": "signature", "severity": "Minor"});
+
+        let prepared = manager
+            .prepare_ips_write(
+                "alice".to_owned(),
+                IpsWriteAction::Update,
+                IpsWriteFamily::Signature,
+                Some("sig-1".to_owned()),
+                body.clone(),
+                &cancellation,
+            )
+            .await
+            .expect("prepare");
+        assert_eq!(
+            prepared.prepared_change.before(),
+            &custom_signature("CUSTOM-X"),
+            "prepare must bind the live object, not assume it"
+        );
+
+        manager
+            .approve(
+                prepared.change_set.change_set_id.clone(),
+                "bob".to_owned(),
+                prepared.change_set.digest.clone(),
+                mecmcp_audit::ActorType::Human,
+            )
+            .await
+            .expect("approve");
+        let applied = manager
+            .apply_ips_write(
+                prepared.change_set.change_set_id,
+                "alice".to_owned(),
+                prepared.change_set.digest,
+                prepared.prepared_change.plan_digest().to_owned(),
+                &Attribution::stdio(),
+                &cancellation,
+            )
+            .await
+            .expect("apply");
+
+        assert!(applied.validation.target_unchanged);
+        assert_eq!(applied.created_uuid, None, "an update reports no new UUID");
+        let sent = writes(&seen);
+        assert_eq!(sent.len(), 1, "exactly one write: {sent:?}");
+        assert_eq!(sent[0].0, "PUT");
+        assert_eq!(sent[0].1, "/api/v1/ips_signatures/sig-1");
+        assert_eq!(sent[0].2, body);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_predefined_signature_is_refused_at_prepare_without_a_change_set() {
+        let mut predefined = custom_signature("HTTP:SQL:INJ:COMMENT");
+        predefined["import_id"] = json!("12345");
+        let (base_url, server, seen) = ips_server(
+            Arc::new(std::sync::Mutex::new(predefined)),
+            axum::http::StatusCode::OK,
+            json!({}),
+        )
+        .await;
+        let (manager, _) = ips_manager(&base_url);
+
+        let error = manager
+            .prepare_ips_write(
+                "alice".to_owned(),
+                IpsWriteAction::Update,
+                IpsWriteFamily::Signature,
+                Some("sig-1".to_owned()),
+                json!({"name": "HTTP:SQL:INJ:COMMENT", "severity": "Info"}),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("a predefined signature must not be planned");
+        assert!(error.to_string().contains("predefined"), "{error}");
+        assert!(writes(&seen).is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_ips_update_that_drifted_after_approval_is_refused_and_released() {
+        let signature = Arc::new(std::sync::Mutex::new(custom_signature("CUSTOM-X")));
+        let (base_url, server, seen) = ips_server(
+            signature.clone(),
+            axum::http::StatusCode::OK,
+            json!({"uuid": "sig-1"}),
+        )
+        .await;
+        let (manager, _) = ips_manager(&base_url);
+        let cancellation = CancellationToken::new();
+
+        let prepared = manager
+            .prepare_ips_write(
+                "alice".to_owned(),
+                IpsWriteAction::Update,
+                IpsWriteFamily::Signature,
+                Some("sig-1".to_owned()),
+                json!({"name": "CUSTOM-X", "severity": "Minor"}),
+                &cancellation,
+            )
+            .await
+            .expect("prepare");
+        manager
+            .approve(
+                prepared.change_set.change_set_id.clone(),
+                "bob".to_owned(),
+                prepared.change_set.digest.clone(),
+                mecmcp_audit::ActorType::Human,
+            )
+            .await
+            .expect("approve");
+
+        // Someone edits the signature in the portal after approval.
+        signature.lock().expect("signature")["severity"] = json!("Critical");
+
+        let error = manager
+            .apply_ips_write(
+                prepared.change_set.change_set_id,
+                "alice".to_owned(),
+                prepared.change_set.digest,
+                prepared.prepared_change.plan_digest().to_owned(),
+                &Attribution::stdio(),
+                &cancellation,
+            )
+            .await
+            .expect_err("a drifted target must not be written");
+        let message = error.to_string();
+        assert!(
+            message.contains("discarded"),
+            "nothing was sent, so the blocked operation must be released: {message}"
+        );
+        assert!(writes(&seen).is_empty(), "the stale PUT must never be sent");
+
+        // The tenant is not wedged: a fresh plan against the new state applies.
+        let replanned = manager
+            .prepare_ips_write(
+                "alice".to_owned(),
+                IpsWriteAction::Update,
+                IpsWriteFamily::Signature,
+                Some("sig-1".to_owned()),
+                json!({"name": "CUSTOM-X", "severity": "Minor"}),
+                &cancellation,
+            )
+            .await
+            .expect("re-prepare");
+        manager
+            .approve(
+                replanned.change_set.change_set_id.clone(),
+                "bob".to_owned(),
+                replanned.change_set.digest.clone(),
+                mecmcp_audit::ActorType::Human,
+            )
+            .await
+            .expect("re-approve");
+        manager
+            .apply_ips_write(
+                replanned.change_set.change_set_id,
+                "alice".to_owned(),
+                replanned.change_set.digest,
+                replanned.prepared_change.plan_digest().to_owned(),
+                &Attribution::stdio(),
+                &cancellation,
+            )
+            .await
+            .expect("a fresh plan applies after a released drift refusal");
+        assert_eq!(writes(&seen).len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_ips_change_set_cannot_be_applied_through_the_object_write_path() {
+        // Each write kind binds its own mutation-policy signature and operation
+        // discriminator, so an approved IPS change set must not be replayable
+        // through apply_sdc_object_write.
+        let (base_url, server, seen) = ips_server(
+            Arc::new(std::sync::Mutex::new(Value::Null)),
+            axum::http::StatusCode::OK,
+            json!({"uuid": "sig-new"}),
+        )
+        .await;
+        let (manager, _) = ips_manager(&base_url);
+        let cancellation = CancellationToken::new();
+        let prepared = manager
+            .prepare_ips_write(
+                "alice".to_owned(),
+                IpsWriteAction::Create,
+                IpsWriteFamily::Signature,
+                None,
+                json!({"name": "CUSTOM-X"}),
+                &cancellation,
+            )
+            .await
+            .expect("prepare");
+        manager
+            .approve(
+                prepared.change_set.change_set_id.clone(),
+                "bob".to_owned(),
+                prepared.change_set.digest.clone(),
+                mecmcp_audit::ActorType::Human,
+            )
+            .await
+            .expect("approve");
+
+        assert!(
+            manager
+                .apply_object_write(
+                    prepared.change_set.change_set_id,
+                    "alice".to_owned(),
+                    prepared.change_set.digest,
+                    prepared.prepared_change.plan_digest().to_owned(),
+                    &Attribution::stdio(),
+                    &cancellation,
+                )
+                .await
+                .is_err(),
+            "an IPS plan must not apply as an object write"
+        );
+        assert!(writes(&seen).is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_planned_ips_write_can_be_released_because_nothing_was_written() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = SdcClient::from_test_parts(
+            "https://example.invalid/",
+            "test-secret".to_owned(),
+            64 * 1024,
+            100,
+        );
+        let transaction =
+            SdcIpsTransaction::new(client, "sha256:unused".to_owned(), CancellationToken::new());
+        let outcome = transaction
+            .rollback(mecmcp_changeset::RollbackRef::CandidateRevert)
+            .await
+            .expect("releasing an uncommitted IPS write must succeed");
+        assert!(outcome.succeeded);
+        transaction
+            .rollback(mecmcp_changeset::RollbackRef::Archive(1))
+            .await
+            .expect_err("SDC has no rollback archive to load");
+    }
+
+    #[tokio::test]
+    async fn ips_write_stage_rejects_a_tampered_or_unapproved_envelope() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = SdcClient::from_test_parts(
+            "https://example.invalid/",
+            "test-secret".to_owned(),
+            64 * 1024,
+            100,
+        );
+        let prepared = ips_update_fixture(custom_signature("CUSTOM-X"));
+        let transaction = SdcIpsTransaction::new(
+            client.clone(),
+            prepared.plan_digest().to_owned(),
+            CancellationToken::new(),
+        );
+        transaction
+            .stage(std::slice::from_ref(&prepared))
+            .await
+            .expect("an intact envelope stages");
+
+        let mut raw = serde_json::to_value(&prepared).expect("serializes");
+        raw["request"]["severity"] = json!("Critical");
+        let tampered: SdcPreparedIpsWrite =
+            serde_json::from_value(raw).expect("tampered envelope still deserializes");
+        transaction
+            .stage(std::slice::from_ref(&tampered))
+            .await
+            .expect_err("a mutated request must not reach commit");
+
+        // An intact envelope bound to a different approved digest is refused.
+        let other = SdcIpsTransaction::new(
+            client,
+            "sha256:someone-elses-plan".to_owned(),
+            CancellationToken::new(),
+        );
+        other
+            .stage(std::slice::from_ref(&prepared))
+            .await
+            .expect_err("a plan must only stage under its own approved digest");
+    }
+
+    #[tokio::test]
+    async fn ips_write_validates_when_the_target_is_unchanged() {
+        // Guards against the drift checks passing vacuously.
+        let (base_url, server, _) = ips_server(
+            Arc::new(std::sync::Mutex::new(custom_signature("CUSTOM-X"))),
+            axum::http::StatusCode::OK,
+            json!({}),
+        )
+        .await;
+        let (_, client) = ips_manager(&base_url);
+        let prepared = ips_update_fixture(custom_signature("CUSTOM-X"));
+        let transaction = SdcIpsTransaction::new(
+            client,
+            prepared.plan_digest().to_owned(),
+            CancellationToken::new(),
+        );
+        let staged = transaction
+            .stage(std::slice::from_ref(&prepared))
+            .await
+            .expect("stages");
+        let report = transaction
+            .validate(&staged)
+            .await
+            .expect("an unchanged target validates");
+        assert!(report.valid && report.target_unchanged);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_ips_validation_rejection_from_sdc_leaves_the_write_discardable() {
+        let (base_url, server, seen) = ips_server(
+            Arc::new(std::sync::Mutex::new(Value::Null)),
+            axum::http::StatusCode::BAD_REQUEST,
+            json!({"code": "invalid", "message": "pattern_sets is malformed"}),
+        )
+        .await;
+        let (_, client) = ips_manager(&base_url);
+        let prepared = SdcPreparedIpsWrite::new(
+            IpsWriteAction::Create,
+            IpsWriteFamily::Signature,
+            None,
+            json!({"name": "CUSTOM-X"}),
+            Value::Null,
+        )
+        .expect("prepared");
+        let transaction = SdcIpsTransaction::new(
+            client,
+            prepared.plan_digest().to_owned(),
+            CancellationToken::new(),
+        );
+        transaction
+            .commit(
+                &prepared,
+                &Attribution::stdio(),
+                &mecmcp_changeset::CommitOptions::default(),
+            )
+            .await
+            .expect_err("a 400 must fail the commit");
+        assert!(
+            transaction.refused_before_write(),
+            "a definitive rejection must be discardable"
+        );
+        assert_eq!(transaction.created_uuid(), None);
+        assert_eq!(writes(&seen).len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_ips_pre_write_recheck_is_still_discardable() {
+        // The target vanished between approval and commit: the recheck read
+        // fails, nothing is sent, and the record must stay discardable.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let app = Router::new().route(
+            "/api/v1/ips_signatures/sig-1",
+            get(|| async { (axum::http::StatusCode::NOT_FOUND, Json(json!({}))) }),
+        );
+        let (base_url, server) = serve(app).await;
+        let client =
+            SdcClient::from_test_parts(base_url.as_str(), "test-secret".to_owned(), 64 * 1024, 100);
+        let prepared = ips_update_fixture(custom_signature("CUSTOM-X"));
+        let transaction = SdcIpsTransaction::new(
+            client,
+            prepared.plan_digest().to_owned(),
+            CancellationToken::new(),
+        );
+        transaction
+            .commit(
+                &prepared,
+                &Attribution::stdio(),
+                &mecmcp_changeset::CommitOptions::default(),
+            )
+            .await
+            .expect_err("a target that vanished must not be written");
+        assert!(
+            transaction.refused_before_write(),
+            "a failed pre-write read must still be discardable"
+        );
+        server.abort();
+    }
 }
