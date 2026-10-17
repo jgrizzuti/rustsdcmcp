@@ -16,8 +16,9 @@ fn tool_registry_has_expected_unique_surface() {
     // list_users_and_roles, a read-only metadata-only IAM tool reopening
     // CLAUDE.md's IAM decision narrowly (see the decision log entry there);
     // it is a `SCOPED_READ_TOOLS` entry, excluded from wildcard tool grants
-    // like a write tool, but not itself a write.
-    assert_eq!(KNOWN_TOOLS.len(), 78);
+    // like a write tool, but not itself a write. #266 added the IPS
+    // signature/profile prepare/apply pair, so 60 reads / 20 writes.
+    assert_eq!(KNOWN_TOOLS.len(), 80);
     assert_eq!(
         KNOWN_TOOLS.iter().copied().collect::<BTreeSet<_>>().len(),
         KNOWN_TOOLS.len()
@@ -30,6 +31,7 @@ fn tool_registry_has_expected_unique_surface() {
             "apply_sdc_firewall_layout_write",
             "apply_sdc_firewall_rule_write",
             "apply_sdc_firewall_write",
+            "apply_sdc_ips_write",
             "apply_sdc_license_write",
             "apply_sdc_nat_write",
             "apply_sdc_object_write",
@@ -39,6 +41,7 @@ fn tool_registry_has_expected_unique_surface() {
             "prepare_sdc_firewall_layout_write",
             "prepare_sdc_firewall_rule_write",
             "prepare_sdc_firewall_write",
+            "prepare_sdc_ips_write",
             "prepare_sdc_license_write",
             "prepare_sdc_nat_write",
             "prepare_sdc_object_write",
@@ -221,6 +224,7 @@ fn redacted_tools_call_finish_redacted() {
         "prepare_sdc_license_write",
         "prepare_sdc_device_inventory_sync",
         "prepare_sdc_object_write",
+        "prepare_sdc_ips_write",
         "prepare_sdc_nat_write",
         "approve_sdc_change_set",
         "apply_sdc_change_set",
@@ -230,6 +234,7 @@ fn redacted_tools_call_finish_redacted() {
         "apply_sdc_license_write",
         "apply_sdc_device_inventory_sync",
         "apply_sdc_object_write",
+        "apply_sdc_ips_write",
         "apply_sdc_nat_write",
         "discard_sdc_operation",
         "list_users_and_roles",

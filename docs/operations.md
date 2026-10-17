@@ -441,6 +441,42 @@ when the token is minted. `mecmcp-auth` enforces this — a wildcard scope is
 defined as "everything except the server's declared write tools" — so there is
 no token scope that grants mutation implicitly.
 
+### IPS signature and profile writes
+
+`prepare_sdc_ips_write` / `apply_sdc_ips_write` create and update custom IPS
+signatures (`family: signature`) and IPS profiles (`family: profile`). They are
+a separate grant from `prepare_sdc_object_write`, so name both tools explicitly
+when minting a token that should author IPS content.
+
+- **Custom signatures only.** An update is refused when the live signature
+  carries a non-empty `import_id` or `activation_date` (the spec's
+  bundle-provenance fields), or when its observed `signature_type` is missing
+  or not one the spec allows. A body may not set `uuid` or `import_id`.
+- **Patterns are shown verbatim.** IPS write results and the change-set
+  details of an IPS write return `pattern_sets[].expression` and
+  `pattern_members[].pattern` / `.regex` exactly, because the generic redaction
+  rewrites detection patterns such as `.*password=.*`. Everything else in those
+  results is redacted as usual. Read tools (`get_sdc_resource`) still apply the
+  generic redaction to signatures.
+- **Whole-object replace.** An update is a `PUT`; send every field to keep.
+  The plan records the observed before-state, and apply refuses if it changed.
+- **SDC only.** A completed IPS write changes SDC's model. It reaches a device
+  only when a firewall policy whose rule references the profile is deployed
+  through `prepare_sdc_policy_deploy` → approve → `apply_sdc_change_set`.
+- **No zone or address scoping inside IPS rules.** SDC's IPS rule model has no
+  match zones, source, or destination. A device-imported IDP policy whose rules
+  matched specific zones and a host was rewritten to `any`/`any`/`any` on the
+  next policy deploy (lab tenant, vSRX 24.4R2.21, 2026-10-13). In SDC, scope
+  comes from the firewall rule the IPS profile is attached to.
+- **Not yet in this path:** delete, IPS rules, and exempt rules (#266).
+
+### SDC commits twice per deploy
+
+SDC applies a policy deploy as `commit confirmed` followed by a confirming
+commit, so a deploy adds **two** entries to the device's commit history. The
+pre-deploy configuration is therefore `rollback 2`, not `rollback 1`, when
+comparing or restoring on the device.
+
 ### Single-operator lab mode
 
 `--lab-mode` waives the second principal. It is off by default, and the server

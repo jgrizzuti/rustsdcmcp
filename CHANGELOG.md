@@ -9,6 +9,24 @@ entries awaiting one coherent `mecmcp` release — **is cleared**. The `compat/`
 layer was deleted in #36 on the move to mecmcp 0.7.2, and the ledger itself in
 `369f9bb` on the move to 0.8.0.
 
+## Unreleased
+
+### Added
+
+- Change-controlled IPS writes: `prepare_sdc_ips_write` / `apply_sdc_ips_write`
+  create and update custom IPS signatures and IPS profiles through the same
+  plan, approval, and drift-checked apply flow as object writes. They are their
+  own grant, so an existing object-write or wildcard token does not gain them.
+  Updates to predefined signatures (those carrying a signature-bundle
+  `import_id`) are refused, and a body may not set `uuid` or `import_id`.
+  A successful create returns the UUID SDC allocated as `created_uuid`.
+  A signature is treated as predefined when it carries `import_id` or
+  `activation_date`, and an update also needs a known observed
+  `signature_type`. IPS write results and IPS change-set details return
+  detection patterns verbatim (the generic redaction rewrote patterns such as
+  `.*password=.*`), while every other field is still redacted.
+  Delete, IPS rules, and exempt rules are not included yet. (#266)
+
 ## `v0.3.1` — 2026-10-15
 
 ### Added

@@ -9,6 +9,7 @@ mod client;
 mod config;
 mod device_sync;
 mod firewall_write;
+mod ips_write;
 mod license_write;
 mod models;
 mod nat_write;
@@ -37,6 +38,10 @@ pub use firewall_write::{
     FirewallApplyResult, FirewallPrepareResult, FirewallValidationReport, FirewallWriteOperation,
     SdcFirewallTransaction, SdcPreparedFirewallWrite,
 };
+pub use ips_write::{
+    IpsApplyResult, IpsPrepareResult, IpsValidationReport, IpsWriteAction, IpsWriteFamily,
+    SdcIpsTransaction, SdcPreparedIpsWrite,
+};
 pub use license_write::{
     LicenseApplyResult, LicensePrepareResult, LicenseValidationReport, LicenseWriteOperation,
     SdcLicenseTransaction, SdcPreparedLicenseWrite,
@@ -59,6 +64,7 @@ pub use projection::{
 };
 pub use redact::{
     REDACTED, apply_oob_drift, contains_redaction_marker, redact_rma_state, redact_secrets,
+    redact_secrets_keeping_ips_patterns,
 };
 pub use rule_layout::{
     FirewallLayoutChange, FirewallLayoutRequest, FirewallRuleLayoutApplyResult,
