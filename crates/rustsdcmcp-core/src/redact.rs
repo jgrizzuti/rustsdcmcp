@@ -541,6 +541,108 @@ fn restore_config_diffs(value: &mut Value, diffs: Vec<(String, String)>) {
     }
 }
 
+/// IPS signature fields that hold detection patterns, not secrets.
+///
+/// `pattern_sets[].expression` and `pattern_sets[].pattern_members[].pattern`
+/// / `.regex` are attack-matching expressions, and the useful ones are exactly
+/// the strings the generic scan treats as credentials: a signature that detects
+/// cleartext logins matches `password=`, one that detects key exfiltration
+/// matches `-----BEGIN RSA PRIVATE KEY-----`. Measured against the generic scan
+/// (#266): `.*password=.*` became `.*password=[REDACTED]`, and a private-key
+/// header pattern became `[REDACTED]` outright.
+const IPS_SET_PATTERN_KEYS: &[&str] = &["expression"];
+const IPS_MEMBER_PATTERN_KEYS: &[&str] = &["pattern", "regex"];
+
+/// [`redact_secrets`], except IPS detection patterns are returned verbatim.
+///
+/// Used only for IPS write results and IPS change-set details, where an
+/// approver must read the exact pattern being approved: a redacted rendering
+/// would show something other than what apply sends. The stored action and
+/// the plan digest are never redacted either way. Every other field, including
+/// a secret sitting next to a pattern, is still redacted as usual. Read tools
+/// keep plain [`redact_secrets`].
+#[must_use]
+pub fn redact_secrets_keeping_ips_patterns(mut value: Value) -> Value {
+    let mut patterns = Vec::new();
+    take_ips_patterns(&mut value, &mut String::new(), &mut patterns);
+    let mut value = redact_secrets(value);
+    for (parent, key, pattern) in patterns {
+        if let Some(Value::Object(map)) = value.pointer_mut(&parent) {
+            map.insert(key, Value::String(pattern));
+        }
+    }
+    value
+}
+
+/// Remove every string IPS pattern field under any `pattern_sets` array,
+/// recording `(parent pointer, key, value)` so it can be restored after the
+/// generic scan has run without ever seeing it.
+fn take_ips_patterns(
+    value: &mut Value,
+    pointer: &mut String,
+    out: &mut Vec<(String, String, String)>,
+) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::Array(sets)) = map.get_mut("pattern_sets") {
+                for (set_index, set) in sets.iter_mut().enumerate() {
+                    let Value::Object(set_map) = set else {
+                        continue;
+                    };
+                    let set_pointer = format!("{pointer}/pattern_sets/{set_index}");
+                    take_string_fields(set_map, &set_pointer, IPS_SET_PATTERN_KEYS, out);
+                    if let Some(Value::Array(members)) = set_map.get_mut("pattern_members") {
+                        for (member_index, member) in members.iter_mut().enumerate() {
+                            if let Value::Object(member_map) = member {
+                                let member_pointer =
+                                    format!("{set_pointer}/pattern_members/{member_index}");
+                                take_string_fields(
+                                    member_map,
+                                    &member_pointer,
+                                    IPS_MEMBER_PATTERN_KEYS,
+                                    out,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            for (key, child) in map.iter_mut() {
+                let mark = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+                take_ips_patterns(child, pointer, out);
+                pointer.truncate(mark);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter_mut().enumerate() {
+                let mark = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&index.to_string());
+                take_ips_patterns(item, pointer, out);
+                pointer.truncate(mark);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn take_string_fields(
+    map: &mut serde_json::Map<String, Value>,
+    parent: &str,
+    keys: &[&str],
+    out: &mut Vec<(String, String, String)>,
+) {
+    for key in keys {
+        if matches!(map.get(*key), Some(Value::String(_)))
+            && let Some(Value::String(pattern)) = map.remove(*key)
+        {
+            out.push((parent.to_owned(), (*key).to_owned(), pattern));
+        }
+    }
+}
+
 /// Whether `value` carries the [`REDACTED`] marker in any string, at any depth.
 ///
 /// The shared crate's free-text scan can rewrite only part of a string (for
@@ -1737,5 +1839,88 @@ mod tests {
     fn clamp_and_sanitize_keeps_plain_ascii_text() {
         let out = clamp_and_sanitize("OUT_OF_BAND_CHANGED", 256);
         assert_eq!(out, "OUT_OF_BAND_CHANGED");
+    }
+
+    /// Detection patterns the generic scan mangles, measured on this crate
+    /// (#266). Each is a legitimate IPS signature pattern.
+    const MANGLED_BY_GENERIC_SCAN: &[&str] = &[
+        r".*password=.*",
+        r".*token=[a-f0-9]{32}.*",
+        r".*Authorization: Bearer .*",
+        r".*-----BEGIN RSA PRIVATE KEY-----.*",
+        "line1\nline2 secret=x",
+    ];
+
+    fn ips_write_result(pattern: &str) -> Value {
+        // The shapes an IPS prepare/apply result and change-set details carry:
+        // the request, the observed before-state, and the plan's after.
+        let signature = serde_json::json!({
+            "name": "CUSTOM-X",
+            "pattern_sets": [{
+                "expression": pattern,
+                "pattern_members": [{ "pattern": pattern, "regex": pattern, "context": "http-header" }]
+            }]
+        });
+        serde_json::json!({
+            "prepared_change": { "request": signature.clone(), "before": signature.clone() },
+            "plan": { "after": signature },
+            "password": "hunter2-real-secret"
+        })
+    }
+
+    #[test]
+    fn the_generic_scan_really_does_mangle_ips_patterns() {
+        // Guards the test below against passing vacuously: if the shared crate
+        // ever stops mangling these, the special case can be reconsidered.
+        for pattern in MANGLED_BY_GENERIC_SCAN {
+            let out = redact_secrets(ips_write_result(pattern));
+            assert_ne!(
+                out["plan"]["after"]["pattern_sets"][0]["pattern_members"][0]["pattern"],
+                Value::String((*pattern).to_owned()),
+                "{pattern:?} is no longer mangled by redact_secrets"
+            );
+        }
+    }
+
+    #[test]
+    fn ips_patterns_survive_while_everything_else_is_still_redacted() {
+        for pattern in MANGLED_BY_GENERIC_SCAN {
+            let out = redact_secrets_keeping_ips_patterns(ips_write_result(pattern));
+            for root in [
+                "/prepared_change/request",
+                "/prepared_change/before",
+                "/plan/after",
+            ] {
+                let set = out.pointer(&format!("{root}/pattern_sets/0")).expect("set");
+                assert_eq!(set["expression"], *pattern, "{root} expression");
+                assert_eq!(
+                    set["pattern_members"][0]["pattern"], *pattern,
+                    "{root} pattern"
+                );
+                assert_eq!(set["pattern_members"][0]["regex"], *pattern, "{root} regex");
+                assert_eq!(set["pattern_members"][0]["context"], "http-header");
+            }
+            assert_eq!(
+                out["password"], REDACTED,
+                "a real secret next to a pattern must still be redacted"
+            );
+        }
+    }
+
+    #[test]
+    fn only_pattern_fields_under_pattern_sets_are_kept() {
+        // The same strings anywhere else are scanned as usual.
+        let out = redact_secrets_keeping_ips_patterns(serde_json::json!({
+            "pattern": ".*password=.*",
+            "description": "matches password=hunter2",
+            "pattern_sets": [{ "pattern_members": [{ "pattern": 42, "notes": "secret=x" }] }]
+        }));
+        assert_ne!(out["pattern"], ".*password=.*");
+        assert_ne!(out["description"], "matches password=hunter2");
+        assert_eq!(out["pattern_sets"][0]["pattern_members"][0]["pattern"], 42);
+        assert_ne!(
+            out["pattern_sets"][0]["pattern_members"][0]["notes"],
+            "secret=x"
+        );
     }
 }

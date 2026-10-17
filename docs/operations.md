@@ -449,9 +449,15 @@ a separate grant from `prepare_sdc_object_write`, so name both tools explicitly
 when minting a token that should author IPS content.
 
 - **Custom signatures only.** An update is refused when the live signature
-  carries a non-empty `import_id`, which the spec documents as present only on
-  predefined signatures imported from the signature bundle. A body may not set
-  `uuid` or `import_id`.
+  carries a non-empty `import_id` or `activation_date` (the spec's
+  bundle-provenance fields), or when its observed `signature_type` is missing
+  or not one the spec allows. A body may not set `uuid` or `import_id`.
+- **Patterns are shown verbatim.** IPS write results and the change-set
+  details of an IPS write return `pattern_sets[].expression` and
+  `pattern_members[].pattern` / `.regex` exactly, because the generic redaction
+  rewrites detection patterns such as `.*password=.*`. Everything else in those
+  results is redacted as usual. Read tools (`get_sdc_resource`) still apply the
+  generic redaction to signatures.
 - **Whole-object replace.** An update is a `PUT`; send every field to keep.
   The plan records the observed before-state, and apply refuses if it changed.
 - **SDC only.** A completed IPS write changes SDC's model. It reaches a device

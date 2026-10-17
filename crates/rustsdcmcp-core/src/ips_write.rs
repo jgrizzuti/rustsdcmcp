@@ -237,14 +237,10 @@ impl SdcPreparedIpsWrite {
             )));
         }
         if let Some(uuid) = self.uuid.as_deref()
-            && (uuid.is_empty()
-                || uuid.len() > 256
-                || uuid
-                    .bytes()
-                    .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace()))
+            && !is_allowed_identifier(uuid)
         {
             return Err(SdcError::PreparedChange(
-                "prepared IPS UUID must be 1-256 non-whitespace bytes".to_owned(),
+                "prepared IPS UUID must be 1-256 characters from [A-Za-z0-9_-:+=]".to_owned(),
             ));
         }
         if let Some(field) = SERVER_ASSIGNED_FIELDS
@@ -268,12 +264,38 @@ impl SdcPreparedIpsWrite {
                     .to_owned(),
             ));
         }
-        if self.family == IpsWriteFamily::Signature && is_predefined_signature(&self.before) {
-            return Err(SdcError::PreparedChange(
-                "refusing to update a predefined signature imported from the signature \
-                 bundle; only custom signatures are writable"
-                    .to_owned(),
-            ));
+        if self.family == IpsWriteFamily::Signature {
+            if let Some(kind) = fields.get("signature_type")
+                && !kind.as_str().is_some_and(is_known_signature_type)
+            {
+                return Err(SdcError::PreparedChange(format!(
+                    "IPS signature_type must be one of {}",
+                    SIGNATURE_TYPES.join(", ")
+                )));
+            }
+            if self.action == IpsWriteAction::Update {
+                // Fail closed: an update needs positive evidence that the
+                // target is custom, not merely the absence of a predefined mark.
+                if !self
+                    .before
+                    .get("signature_type")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_known_signature_type)
+                {
+                    return Err(SdcError::PreparedChange(
+                        "refusing to update a signature whose observed signature_type is \
+                         missing or unknown"
+                            .to_owned(),
+                    ));
+                }
+                if is_predefined_signature(&self.before) {
+                    return Err(SdcError::PreparedChange(
+                        "refusing to update a predefined signature imported from the \
+                         signature bundle; only custom signatures are writable"
+                            .to_owned(),
+                    ));
+                }
+            }
         }
         let plan = self.plan();
         if canonical_digest(&plan).map_err(|error| SdcError::PreparedChange(error.to_string()))?
@@ -296,18 +318,42 @@ impl SdcPreparedIpsWrite {
     }
 }
 
+/// `signature_type` values the vendored spec allows.
+const SIGNATURE_TYPES: &[&str] = &["anomaly", "signature", "chain", "static", "dynamic"];
+
+fn is_known_signature_type(kind: &str) -> bool {
+    SIGNATURE_TYPES.contains(&kind)
+}
+
+/// Bundle-provenance fields from the vendored spec's own field docs:
+/// `import_id` "applicable only for predefined signatures imported from
+/// signature bundles", and `activation_date`, set when a bundle activates a
+/// signature. `signature_type` is the detection kind, shared by both origins.
+const PREDEFINED_MARKERS: &[&str] = &["import_id", "activation_date"];
+
 /// Whether an observed signature came from Juniper's signature bundle.
 ///
-/// The vendored spec documents `import_id` as "applicable only for predefined
-/// signatures imported from signature bundles, not for custom signatures or
-/// groups". It is the only documented discriminator: `signature_type` is the
-/// detection kind (`anomaly`, `signature`, `chain`, `static`, `dynamic`), not
-/// its origin. Not yet confirmed against a live tenant.
+/// Any non-empty provenance marker counts, whatever its JSON type. Confirmed
+/// on a lab tenant (2026-10-15): sampled bundle signatures of the anomaly,
+/// chain and dynamic types all carried `import_id`, and signatures created
+/// through this path carried neither marker.
 fn is_predefined_signature(before: &Value) -> bool {
-    before
-        .get("import_id")
-        .and_then(Value::as_str)
-        .is_some_and(|import_id| !import_id.trim().is_empty())
+    PREDEFINED_MARKERS
+        .iter()
+        .any(|marker| match before.get(*marker) {
+            None | Some(Value::Null) => false,
+            Some(Value::String(text)) => !text.trim().is_empty(),
+            Some(_) => true,
+        })
+}
+
+/// Strict path-segment allowlist for IPS identifiers: 1-256 characters from
+/// `[A-Za-z0-9_-:+=]`. A `/`, `.` or `%` can never reach a request path.
+fn is_allowed_identifier(identifier: &str) -> bool {
+    (1..=256).contains(&identifier.len())
+        && identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-:+=".contains(&byte))
 }
 
 /// The UUID SDC allocated, read from a create response.
@@ -677,6 +723,107 @@ mod tests {
         )
         .expect_err("predefined update must be refused");
         assert!(error.to_string().contains("predefined"));
+    }
+
+    #[test]
+    fn an_activation_date_also_marks_a_signature_predefined() {
+        for marker in [
+            json!("2026-09-01T00:00:00Z"),
+            json!(1_756_684_800),
+            json!(true),
+        ] {
+            let mut bundled = custom_signature();
+            bundled["activation_date"] = marker.clone();
+            assert!(
+                SdcPreparedIpsWrite::new(
+                    IpsWriteAction::Update,
+                    IpsWriteFamily::Signature,
+                    Some("sig-1".to_owned()),
+                    json!({ "name": "CUSTOM-SQL-TIME-BASED" }),
+                    bundled,
+                )
+                .is_err(),
+                "activation_date {marker} must mark the signature predefined"
+            );
+        }
+    }
+
+    #[test]
+    fn an_update_needs_a_known_observed_signature_type() {
+        for observed in [Value::Null, json!("custom"), json!(""), json!(7)] {
+            let mut before = custom_signature();
+            if observed.is_null() {
+                before
+                    .as_object_mut()
+                    .expect("object")
+                    .remove("signature_type");
+            } else {
+                before["signature_type"] = observed.clone();
+            }
+            let error = SdcPreparedIpsWrite::new(
+                IpsWriteAction::Update,
+                IpsWriteFamily::Signature,
+                Some("sig-1".to_owned()),
+                json!({ "name": "CUSTOM-SQL-TIME-BASED" }),
+                before,
+            )
+            .expect_err("unknown observed type must fail closed");
+            assert!(
+                error.to_string().contains("signature_type"),
+                "{observed}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_signature_type_must_be_one_the_spec_allows() {
+        for kind in ["anomaly", "signature", "chain", "static", "dynamic"] {
+            SdcPreparedIpsWrite::new(
+                IpsWriteAction::Create,
+                IpsWriteFamily::Signature,
+                None,
+                json!({ "name": "CUSTOM-X", "signature_type": kind }),
+                Value::Null,
+            )
+            .expect("spec value accepted");
+        }
+        for kind in [json!("custom"), json!("Signature"), json!(1)] {
+            assert!(
+                SdcPreparedIpsWrite::new(
+                    IpsWriteAction::Create,
+                    IpsWriteFamily::Signature,
+                    None,
+                    json!({ "name": "CUSTOM-X", "signature_type": kind }),
+                    Value::Null,
+                )
+                .is_err(),
+                "{kind} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn identifiers_are_held_to_a_strict_allowlist() {
+        assert!(super::is_allowed_identifier(
+            "8ad65be9-3307-4763-b21e-5cf15b3f4653"
+        ));
+        assert!(super::is_allowed_identifier("abc_DEF:1+2="));
+        for bad in [
+            "", "../sig", "sig/1", "sig%2F1", "sig.1", "sig 1", "sig\n1", "sigé",
+        ] {
+            assert!(!super::is_allowed_identifier(bad), "{bad:?} accepted");
+        }
+        assert!(!super::is_allowed_identifier(&"a".repeat(257)));
+        assert!(
+            SdcPreparedIpsWrite::new(
+                IpsWriteAction::Update,
+                IpsWriteFamily::Profile,
+                Some("p/../1".to_owned()),
+                json!({ "name": "P" }),
+                json!({ "uuid": "p", "name": "P" }),
+            )
+            .is_err()
+        );
     }
 
     #[test]

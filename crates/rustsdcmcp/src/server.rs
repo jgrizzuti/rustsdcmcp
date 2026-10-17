@@ -23,7 +23,7 @@ use rustsdcmcp_core::{
     NatWriteOperation, ObjectWriteAction, PolicyOperation, ResourceKind, SdcClient, SdcError,
     WritableResource, apply_oob_drift, page_list, page_paired_lists, project_ca_certificates,
     project_license, project_licenses, project_local_certificates, project_users_and_roles,
-    redact_rma_state, redact_secrets,
+    redact_rma_state, redact_secrets, redact_secrets_keeping_ips_patterns,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -342,9 +342,27 @@ fn finish<T: Serialize>(mut audit: AuditScope, result: Result<T, SdcError>) -> C
 /// fails closed as [`SdcError::InvalidJson`] rather than falling back to the
 /// unredacted value.
 fn finish_redacted<T: Serialize>(audit: AuditScope, result: Result<T, SdcError>) -> CallToolResult {
+    finish_redacted_with(audit, result, redact_secrets)
+}
+
+/// [`finish_redacted`] for IPS write results and IPS change-set details: IPS
+/// detection patterns come back verbatim so an approver reads exactly what
+/// apply will send, and everything else is redacted as usual (#266).
+fn finish_redacted_ips<T: Serialize>(
+    audit: AuditScope,
+    result: Result<T, SdcError>,
+) -> CallToolResult {
+    finish_redacted_with(audit, result, redact_secrets_keeping_ips_patterns)
+}
+
+fn finish_redacted_with<T: Serialize>(
+    audit: AuditScope,
+    result: Result<T, SdcError>,
+    redact: fn(Value) -> Value,
+) -> CallToolResult {
     let result = result.and_then(|value| {
         serde_json::to_value(value)
-            .map(redact_secrets)
+            .map(redact)
             .map_err(|_| SdcError::InvalidJson)
     });
     finish(audit, result)
@@ -3653,7 +3671,7 @@ impl SdcHandler {
             audit.deny("scope");
             return Ok(tool_error(error));
         }
-        Ok(finish_redacted(
+        Ok(finish_redacted_ips(
             audit,
             self.changes
                 .prepare_ips_write(
@@ -3690,7 +3708,7 @@ impl SdcHandler {
             return Ok(tool_error(error));
         }
         let attribution = attribution(caller, args.change_ref);
-        Ok(finish_redacted(
+        Ok(finish_redacted_ips(
             audit,
             self.changes
                 .apply_ips_write(
@@ -4013,11 +4031,22 @@ impl SdcHandler {
             audit.deny("scope");
             return Ok(tool_error(error));
         }
-        Ok(finish_redacted(
-            audit,
-            self.changes.prepared_change(args.change_set_id).await,
-        ))
+        let prepared = self.changes.prepared_change(args.change_set_id).await;
+        // An approver reviews an IPS write here, so its patterns must read
+        // exactly as they will be sent (#266). Every other kind is unchanged.
+        if is_ips_write(&prepared) {
+            Ok(finish_redacted_ips(audit, prepared))
+        } else {
+            Ok(finish_redacted(audit, prepared))
+        }
     }
+}
+
+fn is_ips_write(prepared: &Result<Value, SdcError>) -> bool {
+    matches!(
+        prepared,
+        Ok(value) if value.get("operation").and_then(Value::as_str) == Some("ips_write")
+    )
 }
 
 /// Wrap a filtered tool list in the result shape a 2026-07-28 client accepts.
@@ -4141,6 +4170,43 @@ mod tests {
         let serialized = serde_json::to_string(&call_result).expect("CallToolResult serializes");
         assert!(!serialized.contains("public-secret"));
         assert!(serialized.contains("REDACTED"));
+    }
+
+    /// IPS write results and IPS change-set details keep detection patterns
+    /// verbatim; plain `finish_redacted` would mangle them (#266).
+    #[test]
+    fn ips_results_keep_patterns_while_other_results_do_not() {
+        let value = serde_json::json!({
+            "operation": "ips_write",
+            "request": {
+                "name": "CUSTOM-CLEARTEXT-LOGIN",
+                "pattern_sets": [{ "pattern_members": [{ "pattern": ".*password=.*" }] }]
+            },
+            "api_key": "real-secret-value"
+        });
+        assert!(is_ips_write(&Ok(value.clone())));
+        assert!(!is_ips_write(&Ok(
+            serde_json::json!({"operation": "object_write"})
+        )));
+        assert!(!is_ips_write(&Err(SdcError::InvalidJson)));
+
+        let audit = AuditScope::new(
+            Attribution::stdio(),
+            "get_sdc_change_set_details",
+            "read",
+            vec![],
+        );
+        let kept = serde_json::to_string(&finish_redacted_ips(audit, Ok(value.clone())))
+            .expect("serializes");
+        assert!(kept.contains(r".*password=.*"), "{kept}");
+        assert!(!kept.contains("real-secret-value"), "{kept}");
+
+        let audit = AuditScope::new(Attribution::stdio(), "get_sdc_resource", "read", vec![]);
+        let plain = serde_json::to_string(&finish_redacted(audit, Ok(value))).expect("serializes");
+        assert!(
+            !plain.contains(r".*password=.*"),
+            "read tools keep the generic scan"
+        );
     }
 
     /// Fails closed: a value that cannot serialize to JSON must not fall back
