@@ -1208,14 +1208,21 @@ pub struct PrepareIpsArgs {
     pub action: IpsWriteAction,
     /// `signature` for a custom IPS signature, group, or anomaly
     /// (`/api/v1/ips_signatures`); `profile` for an IPS profile
-    /// (`/api/v1/ips_profiles`).
+    /// (`/api/v1/ips_profiles`); `rule` for an IPS rule inside a profile
+    /// (`/api/v1/ips_profiles/{profile_uuid}/ips_rules`), which is how
+    /// signatures are added to a profile.
     pub family: IpsWriteFamily,
+    /// Parent IPS profile UUID. Required for `rule`, rejected otherwise.
+    #[serde(default)]
+    pub profile_uuid: Option<String>,
     /// Target UUID. Required for update, absent for create.
     #[serde(default)]
     pub uuid: Option<String>,
-    /// Full object definition, as the `IpsSignatureInput` or
-    /// `IpsProfileInput` schema describes it. Must include `name`. An update
-    /// replaces the whole object, so send every field to keep.
+    /// Full object definition, as the `IpsSignatureInput`, `IpsProfileInput`
+    /// or `IPSRuleInput` schema describes it. Must include `name`. A rule also
+    /// needs `ips_signature: [{"uuid": …, "name": …}]` and `then.action` (for
+    /// example `no-action`, `recommended`, `close-client-and-server`). An
+    /// update replaces the whole object, so send every field to keep.
     pub body: Value,
 }
 
@@ -3652,7 +3659,7 @@ impl SdcHandler {
 
     #[tool(
         name = "prepare_sdc_ips_write",
-        description = "Plan one custom IPS signature or IPS profile create or update and create a digest-bound change set. This does not write. Predefined signatures (those with an import_id from the signature bundle) are refused. SDC IPS rules carry no zone or address match: scope comes from the firewall rule the profile is attached to. A completed write changes SDC only; nothing reaches a device until a policy using it is deployed."
+        description = "Plan one custom IPS signature, IPS profile, or IPS rule create or update and create a digest-bound change set. This does not write. Signatures are added to a profile by creating a rule (family `rule`, with `profile_uuid`) that references them; the profile and every referenced signature must already exist. Predefined signatures (those with an import_id or activation_date from the signature bundle) are refused. SDC IPS rules carry no zone or address match: scope comes from the firewall rule the profile is attached to. A completed write changes SDC only; nothing reaches a device until a policy using it is deployed."
     )]
     async fn prepare_sdc_ips_write(
         &self,
@@ -3678,6 +3685,7 @@ impl SdcHandler {
                     owner(caller),
                     args.action,
                     args.family,
+                    args.profile_uuid,
                     args.uuid,
                     args.body,
                     &cancellation,
@@ -4445,11 +4453,23 @@ mod tests {
         .expect("minimal create");
         assert_eq!(ok.family, IpsWriteFamily::Signature);
         assert!(ok.uuid.is_none());
+        assert!(ok.profile_uuid.is_none());
+
+        let rule: PrepareIpsArgs = serde_json::from_value(serde_json::json!({
+            "tenant": "production",
+            "action": "create",
+            "family": "rule",
+            "profile_uuid": "p-1",
+            "body": {"name": "R", "ips_signature": [{"uuid": "s-1"}], "then": {"action": "no-action"}}
+        }))
+        .expect("rule create");
+        assert_eq!(rule.family, IpsWriteFamily::Rule);
+        assert_eq!(rule.profile_uuid.as_deref(), Some("p-1"));
 
         for bad in [
             serde_json::json!({"tenant": "production", "action": "create", "family": "signature"}),
             serde_json::json!({"tenant": "production", "action": "delete", "family": "signature", "body": {"name": "X"}}),
-            serde_json::json!({"tenant": "production", "action": "create", "family": "rule", "body": {"name": "X"}}),
+            serde_json::json!({"tenant": "production", "action": "create", "family": "exempt_rule", "body": {"name": "X"}}),
             serde_json::json!({"tenant": "production", "action": "create", "family": "profile", "body": {"name": "X"}, "resource": "addresses"}),
         ] {
             assert!(

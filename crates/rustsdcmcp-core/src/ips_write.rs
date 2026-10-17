@@ -60,26 +60,46 @@ pub enum IpsWriteFamily {
     Signature,
     /// An IPS profile (`/api/v1/ips_profiles`).
     Profile,
+    /// An IPS rule inside one IPS profile
+    /// (`/api/v1/ips_profiles/{profile_uuid}/ips_rules`). This is how
+    /// signatures are added to a profile: a profile body carries only `name`
+    /// and `description`.
+    Rule,
 }
 
 impl IpsWriteFamily {
     /// Every writable IPS family, for exhaustive iteration in tests.
-    pub const ALL: &'static [Self] = &[Self::Signature, Self::Profile];
+    pub const ALL: &'static [Self] = &[Self::Signature, Self::Profile, Self::Rule];
 
-    /// The read family used for before-state and drift detection.
+    /// The flat read family used for before-state and drift detection, or
+    /// `None` for a rule, which is read through its parent profile.
     #[must_use]
-    pub const fn resource_kind(self) -> ResourceKind {
+    pub const fn resource_kind(self) -> Option<ResourceKind> {
         match self {
-            Self::Signature => ResourceKind::IpsSignatures,
-            Self::Profile => ResourceKind::IpsProfiles,
+            Self::Signature => Some(ResourceKind::IpsSignatures),
+            Self::Profile => Some(ResourceKind::IpsProfiles),
+            Self::Rule => None,
         }
     }
 
-    /// Exact collection path segments, delegated to the read catalog so a
-    /// write and its drift-detection read can never address different paths.
+    /// Whether this family lives under a parent IPS profile.
     #[must_use]
-    pub const fn collection_segments(self) -> &'static [&'static str] {
-        self.resource_kind().collection_segments()
+    pub const fn requires_profile(self) -> bool {
+        matches!(self, Self::Rule)
+    }
+
+    /// Exact collection path segments. Flat families delegate to the read
+    /// catalog, so a write and its drift-detection read can never address
+    /// different paths; a rule's collection is the same one
+    /// `list_sdc_ips_rules` reads. `None` when the parent profile is missing
+    /// for a rule, or supplied for a flat family.
+    #[must_use]
+    pub fn collection_segments(self, profile_uuid: Option<&str>) -> Option<Vec<&str>> {
+        match (self.resource_kind(), profile_uuid) {
+            (Some(kind), None) => Some(kind.collection_segments().to_vec()),
+            (None, Some(profile)) => Some(vec!["api", "v1", "ips_profiles", profile, "ips_rules"]),
+            (Some(_), Some(_)) | (None, None) => None,
+        }
     }
 }
 
@@ -111,6 +131,11 @@ pub struct SdcPreparedIpsWrite {
     operation: String,
     action: IpsWriteAction,
     family: IpsWriteFamily,
+    /// Parent profile of a rule. Absent (not `null`) for flat families, so a
+    /// signature or profile envelope serializes exactly as before rules
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile_uuid: Option<String>,
     uuid: Option<String>,
     request: Value,
     before: Value,
@@ -118,10 +143,10 @@ pub struct SdcPreparedIpsWrite {
 }
 
 impl SdcPreparedIpsWrite {
-    /// Build a canonical, digest-bound IPS write.
+    /// Build a canonical, digest-bound signature or profile write.
     ///
     /// `before` is the target's observed state for update, and `Value::Null`
-    /// for create.
+    /// for create. A rule needs its parent profile: use [`Self::new_rule`].
     ///
     /// # Errors
     ///
@@ -135,11 +160,53 @@ impl SdcPreparedIpsWrite {
         request: Value,
         before: Value,
     ) -> Result<Self, SdcError> {
-        let plan = plan_artifact(action, family, uuid.as_deref(), &request, &before);
+        Self::build(action, family, None, uuid, request, before)
+    }
+
+    /// Build a canonical, digest-bound IPS rule write inside `profile_uuid`.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::new`] refuses, plus a rule body without at least one
+    /// well-formed `ips_signature` reference or without a `then.action`.
+    pub fn new_rule(
+        action: IpsWriteAction,
+        profile_uuid: String,
+        uuid: Option<String>,
+        request: Value,
+        before: Value,
+    ) -> Result<Self, SdcError> {
+        Self::build(
+            action,
+            IpsWriteFamily::Rule,
+            Some(profile_uuid),
+            uuid,
+            request,
+            before,
+        )
+    }
+
+    fn build(
+        action: IpsWriteAction,
+        family: IpsWriteFamily,
+        profile_uuid: Option<String>,
+        uuid: Option<String>,
+        request: Value,
+        before: Value,
+    ) -> Result<Self, SdcError> {
+        let plan = plan_artifact(
+            action,
+            family,
+            profile_uuid.as_deref(),
+            uuid.as_deref(),
+            &request,
+            &before,
+        );
         let prepared = Self {
             operation: "ips_write".to_owned(),
             action,
             family,
+            profile_uuid,
             uuid,
             request,
             before,
@@ -148,6 +215,12 @@ impl SdcPreparedIpsWrite {
         };
         prepared.validate()?;
         Ok(prepared)
+    }
+
+    /// Parent profile of a rule write, absent for flat families.
+    #[must_use]
+    pub fn profile_uuid(&self) -> Option<&str> {
+        self.profile_uuid.as_deref()
     }
 
     /// Product operation discriminator.
@@ -198,6 +271,7 @@ impl SdcPreparedIpsWrite {
         plan_artifact(
             self.action,
             self.family,
+            self.profile_uuid.as_deref(),
             self.uuid.as_deref(),
             &self.request,
             &self.before,
@@ -243,6 +317,22 @@ impl SdcPreparedIpsWrite {
                 "prepared IPS UUID must be 1-256 characters from [A-Za-z0-9_-:+=]".to_owned(),
             ));
         }
+        match (self.family.requires_profile(), self.profile_uuid.as_deref()) {
+            (true, Some(profile)) if is_allowed_identifier(profile) => {}
+            (true, _) => {
+                return Err(SdcError::PreparedChange(
+                    "an IPS rule write requires a profile_uuid of 1-256 characters from \
+                     [A-Za-z0-9_-:+=]"
+                        .to_owned(),
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(SdcError::PreparedChange(
+                    "profile_uuid applies only to IPS rule writes".to_owned(),
+                ));
+            }
+            (false, None) => {}
+        }
         if let Some(field) = SERVER_ASSIGNED_FIELDS
             .iter()
             .find(|field| fields.contains_key(**field))
@@ -258,6 +348,9 @@ impl SdcPreparedIpsWrite {
                 "IPS write body requires a string `name`".to_owned(),
             ));
         };
+        if self.family == IpsWriteFamily::Rule {
+            validate_rule_body(fields)?;
+        }
         if self.family == IpsWriteFamily::Profile && !is_valid_profile_name(name) {
             return Err(SdcError::PreparedChange(
                 "IPS profile name must be 1-127 characters with no space, `#`, `&`, `;`, CR or LF"
@@ -379,17 +472,78 @@ fn is_valid_profile_name(name: &str) -> bool {
 fn plan_artifact(
     action: IpsWriteAction,
     family: IpsWriteFamily,
+    profile_uuid: Option<&str>,
     uuid: Option<&str>,
     request: &Value,
     before: &Value,
 ) -> Value {
-    json!({
+    let mut plan = json!({
         "action": action,
         "family": family,
         "uuid": uuid,
         "before": before,
         "after": request,
-    })
+    });
+    // Bound into the digest for rules only, so the plan (and digest) of a
+    // signature or profile write is byte-identical to before rules existed.
+    if let (Some(profile), Value::Object(map)) = (profile_uuid, &mut plan) {
+        map.insert("profile_uuid".to_owned(), Value::String(profile.to_owned()));
+    }
+    plan
+}
+
+/// Upper bound on signatures referenced by one rule.
+const MAX_RULE_SIGNATURES: usize = 256;
+
+/// A rule body must reference at least one signature by a well-formed UUID
+/// and carry a `then.action`. `IPSRuleInput` requires `name`, `ips_signature`
+/// and `then`; the spec leaves `then` fields unconstrained, so only `action`
+/// is required here, as SDC's own rules always carry one.
+fn validate_rule_body(fields: &serde_json::Map<String, Value>) -> Result<(), SdcError> {
+    let refused = |reason: &str| Err(SdcError::PreparedChange(reason.to_owned()));
+    let Some(Value::Array(references)) = fields.get("ips_signature") else {
+        return refused("an IPS rule body requires an `ips_signature` array");
+    };
+    if references.is_empty() || references.len() > MAX_RULE_SIGNATURES {
+        return refused("an IPS rule must reference 1-256 signatures in `ips_signature`");
+    }
+    for reference in references {
+        if !reference
+            .get("uuid")
+            .and_then(Value::as_str)
+            .is_some_and(is_allowed_identifier)
+        {
+            return refused(
+                "every `ips_signature` entry needs a `uuid` of 1-256 characters from \
+                 [A-Za-z0-9_-:+=]",
+            );
+        }
+    }
+    if !fields
+        .get("then")
+        .and_then(|then| then.get("action"))
+        .and_then(Value::as_str)
+        .is_some_and(|action| !action.trim().is_empty())
+    {
+        return refused("an IPS rule body requires `then.action`");
+    }
+    Ok(())
+}
+
+/// Signature UUIDs a rule body references, in order.
+#[must_use]
+pub fn rule_signature_uuids(request: &Value) -> Vec<String> {
+    request
+        .get("ips_signature")
+        .and_then(Value::as_array)
+        .map(|references| {
+            references
+                .iter()
+                .filter_map(|reference| reference.get("uuid").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Outcome of revalidating an IPS write immediately before commit.
@@ -485,7 +639,12 @@ impl SdcIpsTransaction {
         };
         let current = self
             .client
-            .get_resource(staged.family().resource_kind(), uuid, &self.cancellation)
+            .get_ips_object(
+                staged.family(),
+                staged.profile_uuid(),
+                uuid,
+                &self.cancellation,
+            )
             .await?;
         let digest = |value: &Value| {
             canonical_digest(value).map_err(|error| SdcError::PreparedChange(error.to_string()))
@@ -567,12 +726,23 @@ impl DeviceTransaction for SdcIpsTransaction {
         let result = match (staged.action(), staged.uuid()) {
             (IpsWriteAction::Create, _) => {
                 self.client
-                    .create_ips_object(family, staged.request(), &self.cancellation)
+                    .create_ips_object(
+                        family,
+                        staged.profile_uuid(),
+                        staged.request(),
+                        &self.cancellation,
+                    )
                     .await
             }
             (IpsWriteAction::Update, Some(uuid)) => {
                 self.client
-                    .update_ips_object(family, uuid, staged.request(), &self.cancellation)
+                    .update_ips_object(
+                        family,
+                        staged.profile_uuid(),
+                        uuid,
+                        staged.request(),
+                        &self.cancellation,
+                    )
                     .await
             }
             (IpsWriteAction::Update, None) => {
@@ -671,19 +841,177 @@ mod tests {
 
     #[test]
     fn ips_families_read_and_write_the_same_collections() {
-        for family in IpsWriteFamily::ALL {
+        for family in [IpsWriteFamily::Signature, IpsWriteFamily::Profile] {
+            let kind = family.resource_kind().expect("flat family");
             assert_eq!(
-                family.collection_segments(),
-                family.resource_kind().collection_segments()
+                family.collection_segments(None),
+                Some(kind.collection_segments().to_vec())
             );
+            assert_eq!(family.collection_segments(Some("p-1")), None);
         }
         assert_eq!(
             IpsWriteFamily::Signature.resource_kind(),
-            ResourceKind::IpsSignatures
+            Some(ResourceKind::IpsSignatures)
         );
         assert_eq!(
             IpsWriteFamily::Profile.resource_kind(),
-            ResourceKind::IpsProfiles
+            Some(ResourceKind::IpsProfiles)
+        );
+        // A rule's collection is the one list_sdc_ips_rules reads.
+        assert_eq!(IpsWriteFamily::Rule.resource_kind(), None);
+        assert_eq!(IpsWriteFamily::Rule.collection_segments(None), None);
+        assert_eq!(
+            IpsWriteFamily::Rule.collection_segments(Some("p-1")),
+            Some(vec!["api", "v1", "ips_profiles", "p-1", "ips_rules"])
+        );
+        assert_eq!(json!(IpsWriteFamily::Rule), json!("rule"));
+    }
+
+    fn rule_body() -> Value {
+        json!({
+            "name": "CLAUDE-TEST-266-RULE",
+            "ips_signature": [
+                { "uuid": "8ad65be9-3307-4763-b21e-5cf15b3f4653", "name": "CLAUDE-TEST-266-SIG" },
+                { "uuid": "16955805-a9cd-4a5d-8d77-c6e5b03d558c", "name": "CLAUDE-TEST-266B-SIG" }
+            ],
+            "then": { "action": "no-action", "log_attacks": true },
+            "position": 0
+        })
+    }
+
+    #[test]
+    fn a_rule_create_is_bound_to_its_profile() {
+        let rule = SdcPreparedIpsWrite::new_rule(
+            IpsWriteAction::Create,
+            "ffc405a7-ef24-4a10-a6cb-0f8d4dfabfcc".to_owned(),
+            None,
+            rule_body(),
+            Value::Null,
+        )
+        .expect("rule create");
+        assert_eq!(rule.family(), IpsWriteFamily::Rule);
+        assert_eq!(
+            rule.profile_uuid(),
+            Some("ffc405a7-ef24-4a10-a6cb-0f8d4dfabfcc")
+        );
+        assert_eq!(
+            rule.plan()["profile_uuid"],
+            "ffc405a7-ef24-4a10-a6cb-0f8d4dfabfcc"
+        );
+        assert_eq!(
+            super::rule_signature_uuids(rule.request()),
+            vec![
+                "8ad65be9-3307-4763-b21e-5cf15b3f4653".to_owned(),
+                "16955805-a9cd-4a5d-8d77-c6e5b03d558c".to_owned()
+            ]
+        );
+
+        // The same rule in another profile is a different plan.
+        let elsewhere = SdcPreparedIpsWrite::new_rule(
+            IpsWriteAction::Create,
+            "other-profile".to_owned(),
+            None,
+            rule_body(),
+            Value::Null,
+        )
+        .expect("rule create");
+        assert_ne!(rule.plan_digest(), elsewhere.plan_digest());
+
+        // Moving a persisted rule to another profile breaks the digest.
+        let mut stored = serde_json::to_value(&rule).expect("serialize");
+        stored["profile_uuid"] = json!("other-profile");
+        let moved: SdcPreparedIpsWrite = serde_json::from_value(stored).expect("deserialize");
+        assert!(moved.validate().is_err());
+    }
+
+    #[test]
+    fn flat_families_carry_no_profile_and_keep_their_plan_shape() {
+        let signature = SdcPreparedIpsWrite::new(
+            IpsWriteAction::Create,
+            IpsWriteFamily::Signature,
+            None,
+            json!({ "name": "CUSTOM-X" }),
+            Value::Null,
+        )
+        .expect("signature");
+        assert!(signature.plan().get("profile_uuid").is_none());
+        assert!(
+            serde_json::to_value(&signature)
+                .expect("serialize")
+                .get("profile_uuid")
+                .is_none(),
+            "a signature envelope must serialize exactly as before rules existed"
+        );
+        // A rule cannot be built without its profile.
+        assert!(
+            SdcPreparedIpsWrite::new(
+                IpsWriteAction::Create,
+                IpsWriteFamily::Rule,
+                None,
+                rule_body(),
+                Value::Null,
+            )
+            .is_err()
+        );
+        // A persisted signature envelope with a profile attached is refused.
+        let mut stored = serde_json::to_value(&signature).expect("serialize");
+        stored["profile_uuid"] = json!("p-1");
+        let tampered: SdcPreparedIpsWrite = serde_json::from_value(stored).expect("deserialize");
+        assert!(tampered.validate().is_err());
+    }
+
+    #[test]
+    fn a_rule_body_needs_signatures_and_an_action() {
+        let refused = |body: Value| {
+            SdcPreparedIpsWrite::new_rule(
+                IpsWriteAction::Create,
+                "p-1".to_owned(),
+                None,
+                body,
+                Value::Null,
+            )
+            .is_err()
+        };
+        let without = |key: &str| {
+            let mut body = rule_body();
+            body.as_object_mut().expect("object").remove(key);
+            body
+        };
+        assert!(refused(without("ips_signature")));
+        assert!(refused(without("then")));
+        for references in [
+            json!([]),
+            json!("8ad65be9"),
+            json!([{ "name": "no uuid" }]),
+            json!([{ "uuid": "../escape" }]),
+            json!([{ "uuid": 42 }]),
+        ] {
+            let mut body = rule_body();
+            body["ips_signature"] = references.clone();
+            assert!(refused(body), "{references} accepted");
+        }
+        for then in [json!({}), json!({ "action": "" }), json!({ "action": 1 })] {
+            let mut body = rule_body();
+            body["then"] = then.clone();
+            assert!(refused(body), "{then} accepted");
+        }
+        let mut body = rule_body();
+        body["ips_signature"] = Value::Array(
+            (0..257)
+                .map(|index| json!({ "uuid": format!("sig-{index}") }))
+                .collect(),
+        );
+        assert!(refused(body), "257 references accepted");
+        assert!(
+            SdcPreparedIpsWrite::new_rule(
+                IpsWriteAction::Create,
+                "../p".to_owned(),
+                None,
+                rule_body(),
+                Value::Null,
+            )
+            .is_err(),
+            "the parent profile is held to the identifier allowlist"
         );
     }
 

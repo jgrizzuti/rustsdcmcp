@@ -441,10 +441,11 @@ when the token is minted. `mecmcp-auth` enforces this — a wildcard scope is
 defined as "everything except the server's declared write tools" — so there is
 no token scope that grants mutation implicitly.
 
-### IPS signature and profile writes
+### IPS signature, profile and rule writes
 
 `prepare_sdc_ips_write` / `apply_sdc_ips_write` create and update custom IPS
-signatures (`family: signature`) and IPS profiles (`family: profile`). They are
+signatures (`family: signature`), IPS profiles (`family: profile`) and IPS rules
+inside a profile (`family: rule`, with `profile_uuid`). They are
 a separate grant from `prepare_sdc_object_write`, so name both tools explicitly
 when minting a token that should author IPS content.
 
@@ -468,7 +469,11 @@ when minting a token that should author IPS content.
   matched specific zones and a host was rewritten to `any`/`any`/`any` on the
   next policy deploy (lab tenant, vSRX 24.4R2.21, 2026-10-13). In SDC, scope
   comes from the firewall rule the IPS profile is attached to.
-- **Not yet in this path:** delete, IPS rules, and exempt rules (#266).
+- **Adding signatures to a profile means creating a rule.** A profile body has
+  only `name` and `description`; a rule references signatures by UUID in
+  `ips_signature` and needs `then.action` (for example `no-action`). Prepare
+  refuses a rule unless its profile and every referenced signature exist.
+- **Not yet in this path:** delete and exempt rules (#266).
 
 ### SDC commits twice per deploy
 

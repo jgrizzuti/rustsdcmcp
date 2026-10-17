@@ -25,7 +25,10 @@ layer was deleted in #36 on the move to mecmcp 0.7.2, and the ledger itself in
   `signature_type`. IPS write results and IPS change-set details return
   detection patterns verbatim (the generic redaction rewrote patterns such as
   `.*password=.*`), while every other field is still redacted.
-  Delete, IPS rules, and exempt rules are not included yet. (#266)
+  IPS rules inside a profile (`family: rule` with `profile_uuid`) are how
+  signatures are added to a profile; prepare confirms the profile and every
+  referenced signature exist. Delete and exempt rules are not included yet.
+  (#266)
 
 ## `v0.3.1` — 2026-10-15
 

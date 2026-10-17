@@ -633,26 +633,37 @@ impl ChangeManager {
         })
     }
 
-    /// Resolve an IPS signature's or profile's current state and create its
-    /// digest-bound plan.
+    /// Resolve an IPS signature's, profile's or rule's current state and
+    /// create its digest-bound plan.
     ///
     /// Create carries no prior state; update reads the live object so the plan
     /// records exactly what the write would replace, and so the predefined-
-    /// signature guard sees the target's real origin.
+    /// signature guard sees the target's real origin. A rule also needs its
+    /// parent `profile_uuid`, and both that profile and every signature the
+    /// rule references must exist now, so a wrong UUID fails here rather than
+    /// after an approval.
     ///
     /// # Errors
     ///
-    /// Returns an error when the target cannot be read, the envelope or an IPS
-    /// guard refuses it, or change-control state cannot be written.
+    /// Returns an error when the target, parent profile or a referenced
+    /// signature cannot be read, the envelope or an IPS guard refuses it, or
+    /// change-control state cannot be written.
+    #[allow(clippy::too_many_arguments)]
     pub async fn prepare_ips_write(
         &self,
         owner: String,
         action: IpsWriteAction,
         family: IpsWriteFamily,
+        profile_uuid: Option<String>,
         uuid: Option<String>,
         request: Value,
         cancellation: &CancellationToken,
     ) -> Result<IpsPrepareResult, SdcError> {
+        if family.requires_profile() != profile_uuid.is_some() {
+            return Err(SdcError::InvalidInput(
+                "family `rule` requires profile_uuid; `signature` and `profile` take none",
+            ));
+        }
         let before = match (action, uuid.as_deref()) {
             (IpsWriteAction::Create, None) => Value::Null,
             (IpsWriteAction::Create, Some(_)) => {
@@ -662,14 +673,28 @@ impl ChangeManager {
             }
             (IpsWriteAction::Update, Some(identifier)) => {
                 self.client
-                    .get_resource(family.resource_kind(), identifier, cancellation)
+                    .get_ips_object(family, profile_uuid.as_deref(), identifier, cancellation)
                     .await?
             }
             (IpsWriteAction::Update, None) => {
                 return Err(SdcError::InvalidInput("update requires the target UUID"));
             }
         };
-        let prepared = SdcPreparedIpsWrite::new(action, family, uuid, request, before)?;
+        let prepared = match profile_uuid {
+            Some(profile) => SdcPreparedIpsWrite::new_rule(action, profile, uuid, request, before)?,
+            None => SdcPreparedIpsWrite::new(action, family, uuid, request, before)?,
+        };
+        if let Some(profile) = prepared.profile_uuid() {
+            // Existence checks only; nothing read here is bound into the plan.
+            self.client
+                .get_ips_object(IpsWriteFamily::Profile, None, profile, cancellation)
+                .await?;
+            for signature in crate::rule_signature_uuids(prepared.request()) {
+                self.client
+                    .get_ips_object(IpsWriteFamily::Signature, None, &signature, cancellation)
+                    .await?;
+            }
+        }
         let change_set = self
             .coordinator
             .create_change_set(
@@ -4527,6 +4552,7 @@ mod tests {
                 IpsWriteAction::Create,
                 IpsWriteFamily::Signature,
                 None,
+                None,
                 body.clone(),
                 &cancellation,
             )
@@ -4631,6 +4657,7 @@ mod tests {
                 "alice".to_owned(),
                 IpsWriteAction::Update,
                 IpsWriteFamily::Signature,
+                None,
                 Some("sig-1".to_owned()),
                 body.clone(),
                 &cancellation,
@@ -4691,6 +4718,7 @@ mod tests {
                 "alice".to_owned(),
                 IpsWriteAction::Update,
                 IpsWriteFamily::Signature,
+                None,
                 Some("sig-1".to_owned()),
                 json!({"name": "HTTP:SQL:INJ:COMMENT", "severity": "Info"}),
                 &CancellationToken::new(),
@@ -4719,6 +4747,7 @@ mod tests {
                 "alice".to_owned(),
                 IpsWriteAction::Update,
                 IpsWriteFamily::Signature,
+                None,
                 Some("sig-1".to_owned()),
                 json!({"name": "CUSTOM-X", "severity": "Minor"}),
                 &cancellation,
@@ -4762,6 +4791,7 @@ mod tests {
                 "alice".to_owned(),
                 IpsWriteAction::Update,
                 IpsWriteFamily::Signature,
+                None,
                 Some("sig-1".to_owned()),
                 json!({"name": "CUSTOM-X", "severity": "Minor"}),
                 &cancellation,
@@ -4811,6 +4841,7 @@ mod tests {
                 IpsWriteAction::Create,
                 IpsWriteFamily::Signature,
                 None,
+                None,
                 json!({"name": "CUSTOM-X"}),
                 &cancellation,
             )
@@ -4841,6 +4872,230 @@ mod tests {
             "an IPS plan must not apply as an object write"
         );
         assert!(writes(&seen).is_empty());
+        server.abort();
+    }
+
+    fn rule_body() -> Value {
+        json!({
+            "name": "CUSTOM-RULE",
+            "ips_signature": [
+                { "uuid": "sig-a", "name": "CUSTOM-A" },
+                { "uuid": "sig-b", "name": "CUSTOM-B" }
+            ],
+            "then": { "action": "no-action", "log_attacks": true },
+            "position": 0
+        })
+    }
+
+    fn reads(seen: &Seen) -> Vec<String> {
+        seen.lock()
+            .expect("log")
+            .iter()
+            .filter(|(method, _, _)| method == "GET")
+            .map(|(_, path, _)| path.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_ips_rule_adds_signatures_to_a_profile_after_independent_approval() {
+        let (base_url, server, seen) = ips_server(
+            Arc::new(std::sync::Mutex::new(
+                json!({"uuid": "exists", "name": "x"}),
+            )),
+            axum::http::StatusCode::OK,
+            json!({"uuid": "rule-new", "name": "CUSTOM-RULE"}),
+        )
+        .await;
+        let (manager, _) = ips_manager(&base_url);
+        let cancellation = CancellationToken::new();
+
+        let prepared = manager
+            .prepare_ips_write(
+                "alice".to_owned(),
+                IpsWriteAction::Create,
+                IpsWriteFamily::Rule,
+                Some("p-1".to_owned()),
+                None,
+                rule_body(),
+                &cancellation,
+            )
+            .await
+            .expect("prepare");
+        assert_eq!(prepared.prepared_change.profile_uuid(), Some("p-1"));
+        assert_eq!(
+            reads(&seen),
+            vec![
+                "/api/v1/ips_profiles/p-1".to_owned(),
+                "/api/v1/ips_signatures/sig-a".to_owned(),
+                "/api/v1/ips_signatures/sig-b".to_owned(),
+            ],
+            "prepare must confirm the profile and every referenced signature exist"
+        );
+        assert!(writes(&seen).is_empty());
+
+        assert!(
+            manager
+                .approve(
+                    prepared.change_set.change_set_id.clone(),
+                    "alice".to_owned(),
+                    prepared.change_set.digest.clone(),
+                    mecmcp_audit::ActorType::Human,
+                )
+                .await
+                .is_err(),
+            "the owner cannot approve its own rule"
+        );
+        manager
+            .approve(
+                prepared.change_set.change_set_id.clone(),
+                "bob".to_owned(),
+                prepared.change_set.digest.clone(),
+                mecmcp_audit::ActorType::Human,
+            )
+            .await
+            .expect("independent human approval");
+        let applied = manager
+            .apply_ips_write(
+                prepared.change_set.change_set_id,
+                "alice".to_owned(),
+                prepared.change_set.digest,
+                prepared.prepared_change.plan_digest().to_owned(),
+                &Attribution::stdio(),
+                &cancellation,
+            )
+            .await
+            .expect("apply");
+
+        assert_eq!(applied.created_uuid.as_deref(), Some("rule-new"));
+        assert_eq!(applied.validation.family, IpsWriteFamily::Rule);
+        let sent = writes(&seen);
+        assert_eq!(sent.len(), 1, "exactly one write: {sent:?}");
+        assert_eq!(sent[0].0, "POST");
+        assert_eq!(sent[0].1, "/api/v1/ips_profiles/p-1/ips_rules");
+        assert_eq!(sent[0].2, rule_body(), "the approved rule is sent verbatim");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_rule_referencing_a_missing_signature_is_refused_at_prepare() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let seen: Seen = Arc::default();
+        let log = seen.clone();
+        let app =
+            Router::new().fallback(move |method: axum::http::Method, uri: axum::http::Uri| {
+                let log = log.clone();
+                async move {
+                    let path = uri.path().to_owned();
+                    log.lock()
+                        .expect("log")
+                        .push((method.to_string(), path.clone(), Value::Null));
+                    if path.ends_with("/sig-b") {
+                        (axum::http::StatusCode::NOT_FOUND, Json(json!({})))
+                    } else {
+                        (axum::http::StatusCode::OK, Json(json!({"uuid": "exists"})))
+                    }
+                }
+            });
+        let (base_url, server) = serve(app).await;
+        let (manager, _) = ips_manager(&base_url);
+
+        manager
+            .prepare_ips_write(
+                "alice".to_owned(),
+                IpsWriteAction::Create,
+                IpsWriteFamily::Rule,
+                Some("p-1".to_owned()),
+                None,
+                rule_body(),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("a dangling signature reference must not be planned");
+        assert!(writes(&seen).is_empty());
+
+        // And the family/profile pairing is enforced before any read.
+        let before = seen.lock().expect("log").len();
+        for (family, profile) in [
+            (IpsWriteFamily::Rule, None),
+            (IpsWriteFamily::Signature, Some("p-1".to_owned())),
+        ] {
+            assert!(
+                manager
+                    .prepare_ips_write(
+                        "alice".to_owned(),
+                        IpsWriteAction::Create,
+                        family,
+                        profile,
+                        None,
+                        rule_body(),
+                        &CancellationToken::new(),
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(seen.lock().expect("log").len(), before, "no request sent");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_ips_rule_update_reads_and_puts_the_rule_under_its_profile() {
+        let existing = json!({
+            "uuid": "r-1",
+            "name": "CUSTOM-RULE",
+            "ips_signature": [{ "uuid": "sig-a", "name": "CUSTOM-A" }],
+            "then": { "action": "no-action", "log_attacks": true }
+        });
+        let (base_url, server, seen) = ips_server(
+            Arc::new(std::sync::Mutex::new(existing.clone())),
+            axum::http::StatusCode::OK,
+            json!({"uuid": "r-1"}),
+        )
+        .await;
+        let (manager, _) = ips_manager(&base_url);
+        let cancellation = CancellationToken::new();
+
+        let prepared = manager
+            .prepare_ips_write(
+                "alice".to_owned(),
+                IpsWriteAction::Update,
+                IpsWriteFamily::Rule,
+                Some("p-1".to_owned()),
+                Some("r-1".to_owned()),
+                rule_body(),
+                &cancellation,
+            )
+            .await
+            .expect("prepare");
+        assert_eq!(prepared.prepared_change.before(), &existing);
+        assert_eq!(reads(&seen)[0], "/api/v1/ips_profiles/p-1/ips_rules/r-1");
+
+        manager
+            .approve(
+                prepared.change_set.change_set_id.clone(),
+                "bob".to_owned(),
+                prepared.change_set.digest.clone(),
+                mecmcp_audit::ActorType::Human,
+            )
+            .await
+            .expect("approve");
+        let applied = manager
+            .apply_ips_write(
+                prepared.change_set.change_set_id,
+                "alice".to_owned(),
+                prepared.change_set.digest,
+                prepared.prepared_change.plan_digest().to_owned(),
+                &Attribution::stdio(),
+                &cancellation,
+            )
+            .await
+            .expect("apply");
+        assert!(applied.validation.target_unchanged);
+        let sent = writes(&seen);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "PUT");
+        assert_eq!(sent[0].1, "/api/v1/ips_profiles/p-1/ips_rules/r-1");
+        assert_eq!(sent[0].2, rule_body());
         server.abort();
     }
 
