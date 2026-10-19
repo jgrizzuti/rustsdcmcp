@@ -9,8 +9,11 @@
 //! - **Guards the generic path cannot express.** A predefined signature (one
 //!   imported from Juniper's signature bundle) must never be rewritten, and a
 //!   write body must not smuggle server-assigned identity fields.
-//! - **No delete yet.** Profile delete needs a "still referenced by a firewall
-//!   rule" check, and #266 sequences deletes last.
+//! - **Reference checks before delete.** A profile still referenced by a
+//!   firewall rule or a global setting, or a signature still referenced by an
+//!   IPS or exempt rule, is refused at prepare (see [`find_profile_references`]
+//!   and [`find_signature_references`]) rather than left to fail upstream or
+//!   orphan the referrer.
 //!
 //! Like object writes, IPS writes have no SDC-side preview endpoint, so the
 //! plan artifact is built locally: the exact request together with the
@@ -21,7 +24,7 @@
 //! policy referencing the profile is deployed through
 //! `prepare_sdc_policy_deploy` → approve → `apply_sdc_change_set`.
 
-use crate::{ResourceKind, SdcClient, SdcError, prepared::canonical_digest};
+use crate::{ListRequest, ResourceKind, SdcClient, SdcError, prepared::canonical_digest};
 use async_trait::async_trait;
 use mecmcp_audit::Attribution;
 use mecmcp_changeset::{
@@ -107,10 +110,12 @@ impl IpsWriteFamily {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IpsWriteAction {
-    /// Create a new signature or profile.
+    /// Create a new signature, profile, or rule.
     Create,
-    /// Replace an existing signature or profile by UUID.
+    /// Replace an existing signature, profile, or rule by UUID.
     Update,
+    /// Remove an existing signature, profile, or rule by UUID.
+    Delete,
 }
 
 impl IpsWriteAction {
@@ -120,7 +125,15 @@ impl IpsWriteAction {
         match self {
             Self::Create => "ips_create",
             Self::Update => "ips_update",
+            Self::Delete => "ips_delete",
         }
+    }
+
+    /// Whether this action addresses an existing object, so it needs a target
+    /// UUID and an observed before-state.
+    #[must_use]
+    pub const fn targets_existing(self) -> bool {
+        matches!(self, Self::Update | Self::Delete)
     }
 }
 
@@ -145,8 +158,9 @@ pub struct SdcPreparedIpsWrite {
 impl SdcPreparedIpsWrite {
     /// Build a canonical, digest-bound signature or profile write.
     ///
-    /// `before` is the target's observed state for update, and `Value::Null`
-    /// for create. A rule needs its parent profile: use [`Self::new_rule`].
+    /// `before` is the target's observed state for update and delete, and
+    /// `Value::Null` for create. `request` is `Value::Null` for delete. A rule
+    /// needs its parent profile: use [`Self::new_rule`].
     ///
     /// # Errors
     ///
@@ -247,7 +261,7 @@ impl SdcPreparedIpsWrite {
         self.uuid.as_deref()
     }
 
-    /// Exact request body.
+    /// Exact request body, `Null` for delete.
     #[must_use]
     pub const fn request(&self) -> &Value {
         &self.request
@@ -294,15 +308,24 @@ impl SdcPreparedIpsWrite {
         }
         // Mirror the client's body rule so an unexecutable plan cannot be
         // approved; discovering it only at commit would burn a change set.
-        let Some(fields) = self.request.as_object().filter(|fields| !fields.is_empty()) else {
+        let fields = self.request.as_object().filter(|fields| !fields.is_empty());
+        if self.action == IpsWriteAction::Delete {
+            if !self.request.is_null() {
+                return Err(SdcError::PreparedChange(
+                    "prepared ips_delete must not carry a body".to_owned(),
+                ));
+            }
+        } else if fields.is_none() {
             return Err(SdcError::PreparedChange(format!(
                 "prepared {} requires a non-empty JSON object body",
                 self.action.as_str()
             )));
-        };
+        }
         let shape_ok = match self.action {
             IpsWriteAction::Create => self.uuid.is_none() && self.before.is_null(),
-            IpsWriteAction::Update => self.uuid.is_some() && self.before.is_object(),
+            IpsWriteAction::Update | IpsWriteAction::Delete => {
+                self.uuid.is_some() && self.before.is_object()
+            }
         };
         if !shape_ok {
             return Err(SdcError::PreparedChange(format!(
@@ -333,61 +356,34 @@ impl SdcPreparedIpsWrite {
             }
             (false, None) => {}
         }
-        if let Some(field) = SERVER_ASSIGNED_FIELDS
-            .iter()
-            .find(|field| fields.contains_key(**field))
-        {
-            return Err(SdcError::PreparedChange(format!(
-                "IPS write body must not set the server-assigned field `{field}`"
-            )));
+        if let Some(fields) = fields {
+            self.validate_body(fields)?;
         }
-        // Both input schemas require `name`; requiring it on update too keeps a
-        // PUT from silently blanking it, since SDC replaces the whole object.
-        let Some(name) = fields.get("name").and_then(Value::as_str) else {
-            return Err(SdcError::PreparedChange(
-                "IPS write body requires a string `name`".to_owned(),
-            ));
-        };
-        if self.family == IpsWriteFamily::Rule {
-            validate_rule_body(fields)?;
-        }
-        if self.family == IpsWriteFamily::Profile && !is_valid_profile_name(name) {
-            return Err(SdcError::PreparedChange(
-                "IPS profile name must be 1-127 characters with no space, `#`, `&`, `;`, CR or LF"
-                    .to_owned(),
-            ));
-        }
-        if self.family == IpsWriteFamily::Signature {
-            if let Some(kind) = fields.get("signature_type")
-                && !kind.as_str().is_some_and(is_known_signature_type)
+        if self.family == IpsWriteFamily::Signature && self.action.targets_existing() {
+            let verb = if self.action == IpsWriteAction::Delete {
+                "delete"
+            } else {
+                "update"
+            };
+            // Fail closed: changing an existing signature needs positive
+            // evidence that it is custom, not merely the absence of a
+            // predefined mark.
+            if !self
+                .before
+                .get("signature_type")
+                .and_then(Value::as_str)
+                .is_some_and(is_known_signature_type)
             {
                 return Err(SdcError::PreparedChange(format!(
-                    "IPS signature_type must be one of {}",
-                    SIGNATURE_TYPES.join(", ")
+                    "refusing to {verb} a signature whose observed signature_type is \
+                     missing or unknown"
                 )));
             }
-            if self.action == IpsWriteAction::Update {
-                // Fail closed: an update needs positive evidence that the
-                // target is custom, not merely the absence of a predefined mark.
-                if !self
-                    .before
-                    .get("signature_type")
-                    .and_then(Value::as_str)
-                    .is_some_and(is_known_signature_type)
-                {
-                    return Err(SdcError::PreparedChange(
-                        "refusing to update a signature whose observed signature_type is \
-                         missing or unknown"
-                            .to_owned(),
-                    ));
-                }
-                if is_predefined_signature(&self.before) {
-                    return Err(SdcError::PreparedChange(
-                        "refusing to update a predefined signature imported from the \
-                         signature bundle; only custom signatures are writable"
-                            .to_owned(),
-                    ));
-                }
+            if is_predefined_signature(&self.before) {
+                return Err(SdcError::PreparedChange(format!(
+                    "refusing to {verb} a predefined signature imported from the \
+                     signature bundle; only custom signatures are writable"
+                )));
             }
         }
         let plan = self.plan();
@@ -406,6 +402,47 @@ impl SdcPreparedIpsWrite {
             return Err(SdcError::PreparedChange(
                 "prepared IPS write exceeds the 2097152-byte limit".to_owned(),
             ));
+        }
+        Ok(())
+    }
+
+    /// Guards on a create or update body.
+    fn validate_body(&self, fields: &serde_json::Map<String, Value>) -> Result<(), SdcError> {
+        if let Some(field) = SERVER_ASSIGNED_FIELDS
+            .iter()
+            .find(|field| fields.contains_key(**field))
+        {
+            return Err(SdcError::PreparedChange(format!(
+                "IPS write body must not set the server-assigned field `{field}`"
+            )));
+        }
+        // Both input schemas require `name`; requiring it on update too keeps a
+        // PUT from silently blanking it, since SDC replaces the whole object.
+        let Some(name) = fields.get("name").and_then(Value::as_str) else {
+            return Err(SdcError::PreparedChange(
+                "IPS write body requires a string `name`".to_owned(),
+            ));
+        };
+        match self.family {
+            IpsWriteFamily::Rule => validate_rule_body(fields)?,
+            IpsWriteFamily::Profile if !is_valid_profile_name(name) => {
+                return Err(SdcError::PreparedChange(
+                    "IPS profile name must be 1-127 characters with no space, `#`, `&`, `;`, \
+                     CR or LF"
+                        .to_owned(),
+                ));
+            }
+            IpsWriteFamily::Signature => {
+                if let Some(kind) = fields.get("signature_type")
+                    && !kind.as_str().is_some_and(is_known_signature_type)
+                {
+                    return Err(SdcError::PreparedChange(format!(
+                        "IPS signature_type must be one of {}",
+                        SIGNATURE_TYPES.join(", ")
+                    )));
+                }
+            }
+            IpsWriteFamily::Profile => {}
         }
         Ok(())
     }
@@ -546,6 +583,257 @@ pub fn rule_signature_uuids(request: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Upper bound on SDC reads one reference scan may issue.
+///
+/// A scan that cannot finish inside this budget has not shown the target is
+/// unreferenced, so it refuses the delete instead of reporting a partial pass.
+const MAX_REFERENCE_SCAN_REQUESTS: usize = 500;
+
+/// How many referrers a refusal names; the total is always reported.
+const MAX_REPORTED_REFERENCES: usize = 20;
+
+/// Read budget shared by every request of one reference scan.
+struct ScanBudget {
+    remaining: usize,
+}
+
+impl ScanBudget {
+    const fn new() -> Self {
+        Self {
+            remaining: MAX_REFERENCE_SCAN_REQUESTS,
+        }
+    }
+
+    fn spend(&mut self) -> Result<(), SdcError> {
+        let Some(remaining) = self.remaining.checked_sub(1) else {
+            return Err(SdcError::PreparedChange(format!(
+                "the reference check needed more than {MAX_REFERENCE_SCAN_REQUESTS} SDC reads; \
+                 refusing the delete because the target could not be shown unreferenced"
+            )));
+        };
+        self.remaining = remaining;
+        Ok(())
+    }
+}
+
+/// Every item of one paged collection, read at the client's maximum page size.
+///
+/// Stops at the first short page rather than trusting `count`, which the spec
+/// types as a string for some IPS collections. A response whose `items` is
+/// present but not an array is refused: a scan must not pass on a shape it
+/// could not read.
+async fn collect_items<F, Fut>(
+    client: &SdcClient,
+    budget: &mut ScanBudget,
+    mut fetch: F,
+) -> Result<Vec<Value>, SdcError>
+where
+    F: FnMut(ListRequest) -> Fut,
+    Fut: Future<Output = Result<Value, SdcError>>,
+{
+    let size = client.max_page_size();
+    let mut from = 0_u64;
+    let mut items = Vec::new();
+    loop {
+        budget.spend()?;
+        let response = fetch(ListRequest::new(from, size, size)?).await?;
+        let page = match response.get("items") {
+            None | Some(Value::Null) => &[][..],
+            Some(Value::Array(page)) => page.as_slice(),
+            Some(_) => {
+                return Err(SdcError::PreparedChange(
+                    "the reference check could not read a list response's `items`".to_owned(),
+                ));
+            }
+        };
+        items.extend(page.iter().cloned());
+        if page.len() < usize::try_from(size).unwrap_or(usize::MAX) {
+            return Ok(items);
+        }
+        from += u64::from(size);
+    }
+}
+
+/// Whether `holder.ips_profile.uuid` names `profile_uuid`.
+fn names_profile(holder: Option<&Value>, profile_uuid: &str) -> bool {
+    holder
+        .and_then(|holder| holder.get("ips_profile"))
+        .and_then(|reference| reference.get("uuid"))
+        .and_then(Value::as_str)
+        == Some(profile_uuid)
+}
+
+/// UUID of a listed item, or a placeholder when SDC omitted it.
+fn item_uuid(item: &Value) -> &str {
+    item.get("uuid").and_then(Value::as_str).unwrap_or("?")
+}
+
+/// Refuse a delete when anything still references its target.
+fn refuse_if_referenced(target: &str, referrers: &[String]) -> Result<(), SdcError> {
+    if referrers.is_empty() {
+        return Ok(());
+    }
+    let shown = referrers
+        .iter()
+        .take(MAX_REPORTED_REFERENCES)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = referrers.len().saturating_sub(MAX_REPORTED_REFERENCES);
+    let more = if more > 0 {
+        format!(" and {more} more")
+    } else {
+        String::new()
+    };
+    Err(SdcError::PreparedChange(format!(
+        "refusing to delete {target}: still referenced by {} object(s): {shown}{more}",
+        referrers.len()
+    )))
+}
+
+/// Everything that still references one IPS profile.
+///
+/// Checks every firewall policy's global and zone rules
+/// (`advanced_security.ips_profile`), the tenant's firewall global settings
+/// and global profile, and every device's firewall global settings. A rule
+/// that inherits its profile carries no UUID, so it is covered by the global
+/// setting it inherits from. Bounded at 500 SDC reads.
+///
+/// # Errors
+///
+/// Returns an error when any read fails or the scan exceeds its budget; the
+/// delete is then refused rather than planned on an incomplete check.
+pub async fn find_profile_references(
+    client: &SdcClient,
+    profile_uuid: &str,
+    cancellation: &CancellationToken,
+) -> Result<Vec<String>, SdcError> {
+    let mut budget = ScanBudget::new();
+    let mut referrers = Vec::new();
+    for (label, singleton) in [
+        (
+            "firewall global settings",
+            client.get_firewall_global_settings(cancellation).await?,
+        ),
+        (
+            "firewall global profile",
+            client.get_firewall_global_profile(cancellation).await?,
+        ),
+    ] {
+        budget.spend()?;
+        if names_profile(Some(&singleton), profile_uuid) {
+            referrers.push(label.to_owned());
+        }
+    }
+    for device in collect_items(client, &mut budget, move |page| {
+        client.list_device_global_settings(None, page, cancellation)
+    })
+    .await?
+    {
+        if names_profile(Some(&device), profile_uuid) {
+            let id = device
+                .get("device_id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| item_uuid(&device));
+            referrers.push(format!("device global settings {id}"));
+        }
+    }
+    let policies = collect_items(client, &mut budget, move |page| {
+        client.list_firewall_policies(page, cancellation)
+    })
+    .await?;
+    for policy in &policies {
+        let policy_uuid = item_uuid(policy);
+        for scope in ["global", "zone"] {
+            for rule in collect_items(client, &mut budget, move |page| {
+                client.list_firewall_rules(policy_uuid, scope, page, cancellation)
+            })
+            .await?
+            {
+                if names_profile(rule.get("advanced_security"), profile_uuid) {
+                    referrers.push(format!(
+                        "firewall rule {policy_uuid}/{scope}/{}",
+                        item_uuid(&rule)
+                    ));
+                }
+            }
+        }
+    }
+    Ok(referrers)
+}
+
+/// Every IPS rule and exempt rule, in any profile, that still references one
+/// signature through `ips_signature[].uuid`.
+///
+/// Signature-group membership is not scanned: finding it means reading every
+/// signature in the tenant (tens of thousands with the predefined bundle), so
+/// SDC's own `409` remains the backstop there. Bounded by
+/// 500 SDC reads.
+///
+/// # Errors
+///
+/// Returns an error when any read fails or the scan exceeds its budget.
+pub async fn find_signature_references(
+    client: &SdcClient,
+    signature_uuid: &str,
+    cancellation: &CancellationToken,
+) -> Result<Vec<String>, SdcError> {
+    let mut budget = ScanBudget::new();
+    let mut referrers = Vec::new();
+    let profiles = collect_items(client, &mut budget, move |page| {
+        client.list_resource(ResourceKind::IpsProfiles, page, &[], cancellation)
+    })
+    .await?;
+    for profile in &profiles {
+        let profile_uuid = item_uuid(profile);
+        let rules = collect_items(client, &mut budget, move |page| {
+            client.list_ips_rules(profile_uuid, page, cancellation)
+        })
+        .await?;
+        let exempt = collect_items(client, &mut budget, move |page| {
+            client.list_ips_exempt_rules(profile_uuid, page, cancellation)
+        })
+        .await?;
+        for (kind, items) in [("IPS rule", rules), ("IPS exempt rule", exempt)] {
+            for rule in items {
+                if rule_signature_uuids(&rule)
+                    .iter()
+                    .any(|uuid| uuid == signature_uuid)
+                {
+                    referrers.push(format!("{kind} {profile_uuid}/{}", item_uuid(&rule)));
+                }
+            }
+        }
+    }
+    Ok(referrers)
+}
+
+/// Refuse deleting a profile or signature that is still referenced.
+///
+/// Rules are leaves, so a rule delete needs no scan.
+///
+/// # Errors
+///
+/// Returns an error naming the referrers, or when the scan cannot complete.
+pub async fn ensure_unreferenced(
+    client: &SdcClient,
+    family: IpsWriteFamily,
+    uuid: &str,
+    cancellation: &CancellationToken,
+) -> Result<(), SdcError> {
+    match family {
+        IpsWriteFamily::Profile => refuse_if_referenced(
+            &format!("IPS profile {uuid}"),
+            &find_profile_references(client, uuid, cancellation).await?,
+        ),
+        IpsWriteFamily::Signature => refuse_if_referenced(
+            &format!("IPS signature {uuid}"),
+            &find_signature_references(client, uuid, cancellation).await?,
+        ),
+        IpsWriteFamily::Rule => Ok(()),
+    }
+}
+
 /// Outcome of revalidating an IPS write immediately before commit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpsValidationReport {
@@ -580,8 +868,8 @@ pub struct IpsApplyResult {
     /// Known, detached, or indeterminate commit disposition.
     pub outcome: CommitOutcome,
     /// UUID SDC allocated for a successful create, so a follow-up update can
-    /// address it without searching the collection. `None` for update, and
-    /// for a create whose response carried no UUID.
+    /// address it without searching the collection. `None` for update and
+    /// delete, and for a create whose response carried no UUID.
     pub created_uuid: Option<String>,
 }
 
@@ -634,7 +922,7 @@ impl SdcIpsTransaction {
     ///
     /// Create has no prior object, so it is vacuously unchanged.
     async fn target_unchanged(&self, staged: &SdcPreparedIpsWrite) -> Result<bool, SdcError> {
-        let (IpsWriteAction::Update, Some(uuid)) = (staged.action(), staged.uuid()) else {
+        let Some(uuid) = staged.uuid().filter(|_| staged.action().targets_existing()) else {
             return Ok(true);
         };
         let current = self
@@ -745,11 +1033,17 @@ impl DeviceTransaction for SdcIpsTransaction {
                     )
                     .await
             }
-            (IpsWriteAction::Update, None) => {
+            (IpsWriteAction::Delete, Some(uuid)) => {
+                self.client
+                    .delete_ips_object(family, staged.profile_uuid(), uuid, &self.cancellation)
+                    .await
+            }
+            (IpsWriteAction::Update | IpsWriteAction::Delete, None) => {
                 self.refused_before_write.store(true, Ordering::SeqCst);
-                return Err(SdcError::PreparedChange(
-                    "prepared IPS update is missing its target UUID".to_owned(),
-                ));
+                return Err(SdcError::PreparedChange(format!(
+                    "prepared {} is missing its target UUID",
+                    staged.action().as_str()
+                )));
             }
         };
         match result {
@@ -824,7 +1118,7 @@ impl DeviceTransaction for SdcIpsTransaction {
 mod tests {
     use super::{
         IpsWriteAction, IpsWriteFamily, SdcPreparedIpsWrite, created_uuid_from,
-        is_valid_profile_name,
+        is_valid_profile_name, refuse_if_referenced,
     };
     use crate::ResourceKind;
     use serde_json::{Value, json};
@@ -1241,6 +1535,100 @@ mod tests {
     }
 
     #[test]
+    fn a_delete_carries_no_body_and_binds_the_observed_target() {
+        let delete = SdcPreparedIpsWrite::new(
+            IpsWriteAction::Delete,
+            IpsWriteFamily::Profile,
+            Some("p-1".to_owned()),
+            Value::Null,
+            json!({ "uuid": "p-1", "name": "P" }),
+        )
+        .expect("profile delete");
+        assert!(delete.request().is_null());
+        assert_eq!(delete.plan()["action"], "delete");
+        assert_eq!(delete.plan()["before"]["name"], "P");
+
+        let rule = SdcPreparedIpsWrite::new_rule(
+            IpsWriteAction::Delete,
+            "p-1".to_owned(),
+            Some("r-1".to_owned()),
+            Value::Null,
+            json!({ "uuid": "r-1", "name": "R" }),
+        )
+        .expect("rule delete needs no rule body");
+        assert_eq!(rule.plan()["profile_uuid"], "p-1");
+
+        for (uuid, request, before) in [
+            // A body.
+            (
+                Some("p-1".to_owned()),
+                json!({ "name": "P" }),
+                json!({ "uuid": "p-1" }),
+            ),
+            // No target UUID.
+            (None, Value::Null, json!({ "uuid": "p-1" })),
+            // No observed before-state.
+            (Some("p-1".to_owned()), Value::Null, Value::Null),
+        ] {
+            assert!(
+                SdcPreparedIpsWrite::new(
+                    IpsWriteAction::Delete,
+                    IpsWriteFamily::Profile,
+                    uuid,
+                    request,
+                    before,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_predefined_or_unknown_signature_is_never_deleted() {
+        assert!(
+            SdcPreparedIpsWrite::new(
+                IpsWriteAction::Delete,
+                IpsWriteFamily::Signature,
+                Some("sig-1".to_owned()),
+                Value::Null,
+                custom_signature(),
+            )
+            .is_ok(),
+            "a custom signature is deletable"
+        );
+        let mut predefined = custom_signature();
+        predefined["activation_date"] = json!("2026-01-01");
+        let mut unknown = custom_signature();
+        unknown["signature_type"] = json!("bundle");
+        for before in [predefined, unknown] {
+            let error = SdcPreparedIpsWrite::new(
+                IpsWriteAction::Delete,
+                IpsWriteFamily::Signature,
+                Some("sig-1".to_owned()),
+                Value::Null,
+                before,
+            )
+            .expect_err("only a known custom signature may be deleted");
+            assert!(error.to_string().contains("refusing to delete"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_names_a_bounded_number_of_referrers() {
+        assert!(refuse_if_referenced("IPS profile p-1", &[]).is_ok());
+        let referrers = (0..25)
+            .map(|n| format!("firewall rule pol/zone/r-{n}"))
+            .collect::<Vec<_>>();
+        let error = refuse_if_referenced("IPS profile p-1", &referrers)
+            .expect_err("referenced")
+            .to_string();
+        assert!(error.contains("25 object(s)"), "{error}");
+        assert!(error.contains("r-19"), "{error}");
+        assert!(!error.contains("r-20"), "{error}");
+        assert!(error.contains("and 5 more"), "{error}");
+    }
+
+    #[test]
     fn profile_names_follow_the_spec_format() {
         assert!(is_valid_profile_name("PROTECT-DVWA"));
         assert!(is_valid_profile_name(&"a".repeat(127)));
@@ -1321,5 +1709,7 @@ mod tests {
         assert_eq!(json!(IpsWriteFamily::Profile), json!("profile"));
         assert_eq!(json!(IpsWriteAction::Create), json!("create"));
         assert_eq!(json!(IpsWriteAction::Update), json!("update"));
+        assert_eq!(json!(IpsWriteAction::Delete), json!("delete"));
+        assert_eq!(IpsWriteAction::Delete.as_str(), "ips_delete");
     }
 }

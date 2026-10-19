@@ -1457,6 +1457,27 @@ impl SdcClient {
             .await
     }
 
+    /// Delete one custom IPS signature, IPS profile, or (with
+    /// `profile_uuid`) IPS rule by UUID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an identifier is invalid, the family and
+    /// `profile_uuid` do not match, or the SDC request fails.
+    pub async fn delete_ips_object(
+        &self,
+        family: crate::IpsWriteFamily,
+        profile_uuid: Option<&str>,
+        uuid: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, SdcError> {
+        validate_atom("uuid", uuid)?;
+        let mut segments = Self::ips_collection(family, profile_uuid)?;
+        segments.push(uuid);
+        self.send_write(Method::DELETE, &segments, None, cancellation)
+            .await
+    }
+
     /// List IPsec profiles with bounded pagination.
     ///
     /// This is a `/api/v2/` endpoint, unlike most policy and device operations.

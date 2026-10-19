@@ -27,7 +27,13 @@ layer was deleted in #36 on the move to mecmcp 0.7.2, and the ledger itself in
   `.*password=.*`), while every other field is still redacted.
   IPS rules inside a profile (`family: rule` with `profile_uuid`) are how
   signatures are added to a profile; prepare confirms the profile and every
-  referenced signature exist. Delete and exempt rules are not included yet.
+  referenced signature exist. Signatures, profiles and rules can also be
+  deleted. Prepare refuses to delete a profile still referenced by a firewall
+  rule, the firewall global settings or global profile, or a device's global
+  settings, or a signature still referenced by an IPS or exempt rule, and names
+  the referrers. That reference scan is capped at 500 SDC reads and refuses the
+  delete if it cannot finish. Predefined signatures are never deleted.
+  Exempt-rule writes are not included yet.
   (#266)
 
 ## `v0.3.1` — 2026-10-15
