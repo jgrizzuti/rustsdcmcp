@@ -441,14 +441,15 @@ when the token is minted. `mecmcp-auth` enforces this — a wildcard scope is
 defined as "everything except the server's declared write tools" — so there is
 no token scope that grants mutation implicitly.
 
-### IPS signature and profile writes
+### IPS signature, profile and rule writes
 
-`prepare_sdc_ips_write` / `apply_sdc_ips_write` create and update custom IPS
-signatures (`family: signature`) and IPS profiles (`family: profile`). They are
+`prepare_sdc_ips_write` / `apply_sdc_ips_write` create, update and delete custom
+IPS signatures (`family: signature`), IPS profiles (`family: profile`) and IPS rules
+inside a profile (`family: rule`, with `profile_uuid`). They are
 a separate grant from `prepare_sdc_object_write`, so name both tools explicitly
 when minting a token that should author IPS content.
 
-- **Custom signatures only.** An update is refused when the live signature
+- **Custom signatures only.** An update or delete is refused when the live signature
   carries a non-empty `import_id` or `activation_date` (the spec's
   bundle-provenance fields), or when its observed `signature_type` is missing
   or not one the spec allows. A body may not set `uuid` or `import_id`.
@@ -468,7 +469,27 @@ when minting a token that should author IPS content.
   matched specific zones and a host was rewritten to `any`/`any`/`any` on the
   next policy deploy (lab tenant, vSRX 24.4R2.21, 2026-10-13). In SDC, scope
   comes from the firewall rule the IPS profile is attached to.
-- **Not yet in this path:** delete, IPS rules, and exempt rules (#266).
+- **Adding signatures to a profile means creating a rule.** A profile body has
+  only `name` and `description`; a rule references signatures by UUID in
+  `ips_signature` and needs `then.action` (for example `no-action`). Prepare
+  refuses a rule unless its profile and every referenced signature exist.
+- **Delete is refused while anything still references the target.** Prepare
+  scans before planning a delete and names up to 20 referrers:
+  - a profile: every firewall policy's global and zone rules
+    (`advanced_security.ips_profile`), the firewall global settings and global
+    profile, and every device's firewall global settings. A rule that inherits
+    its profile is covered by the global setting it inherits from.
+  - a signature: every IPS rule and exempt rule in every profile. Membership in
+    a signature group is not scanned, because finding it means reading the
+    whole signature catalogue (tens of thousands of entries); SDC's own `409`
+    is the backstop there.
+  - a rule: nothing; rules are leaves.
+
+  A scan is capped at 500 SDC reads. One that cannot finish inside that budget
+  refuses the delete rather than passing on a partial read. The scan runs at
+  prepare only, so a reference added between approval and apply is left to
+  SDC's `409`. A delete sends no body.
+- **Not yet in this path:** exempt-rule writes (#266).
 
 ### SDC commits twice per deploy
 
