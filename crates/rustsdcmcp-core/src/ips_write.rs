@@ -616,12 +616,22 @@ impl ScanBudget {
     }
 }
 
+/// Refusal for a reference scan that could not read a collection completely.
+fn partial_scan(reason: &str) -> SdcError {
+    SdcError::PreparedChange(format!(
+        "the reference check could not read a collection completely ({reason}); \
+         refusing the delete because the target could not be shown unreferenced"
+    ))
+}
+
 /// Every item of one paged collection, read at the client's maximum page size.
 ///
-/// Stops at the first short page rather than trusting `count`, which the spec
-/// types as a string for some IPS collections. A response whose `items` is
-/// present but not an array is refused: a scan must not pass on a shape it
-/// could not read.
+/// Stops at the first short page, then checks the items read against the
+/// response's `count` (a number or numeric string, as the spec types it both
+/// ways). A scan that read fewer items than `count`, a `count` it cannot
+/// parse, a missing `items` beside a non-zero `count`, or an `items` that is
+/// not an array is refused: a scan must not pass on a partial or unreadable
+/// response. When `count` is absent a short page is taken as the end.
 async fn collect_items<F, Fut>(
     client: &SdcClient,
     budget: &mut ScanBudget,
@@ -637,7 +647,21 @@ where
     loop {
         budget.spend()?;
         let response = fetch(ListRequest::new(from, size, size)?).await?;
+        let count = match response.get("count") {
+            None | Some(Value::Null) => None,
+            Some(Value::Number(n)) => n.as_u64(),
+            Some(Value::String(s)) => s.trim().parse::<u64>().ok(),
+            Some(_) => None,
+        };
+        if response.get("count").is_some_and(|c| !c.is_null()) && count.is_none() {
+            return Err(partial_scan("a list response's `count` was not a number"));
+        }
         let page = match response.get("items") {
+            None | Some(Value::Null) if count.is_some_and(|c| c > 0) => {
+                return Err(partial_scan(
+                    "a list response carried a count but no `items`",
+                ));
+            }
             None | Some(Value::Null) => &[][..],
             Some(Value::Array(page)) => page.as_slice(),
             Some(_) => {
@@ -648,6 +672,11 @@ where
         };
         items.extend(page.iter().cloned());
         if page.len() < usize::try_from(size).unwrap_or(usize::MAX) {
+            if count.is_some_and(|c| u64::try_from(items.len()).unwrap_or(u64::MAX) < c) {
+                return Err(partial_scan(
+                    "a list response ended before the reported `count` was read",
+                ));
+            }
             return Ok(items);
         }
         from += u64::from(size);

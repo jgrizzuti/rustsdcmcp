@@ -5447,6 +5447,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_scan_that_reads_fewer_items_than_count_refuses_the_delete() {
+        for profiles in [
+            // A page capped below the requested size, with more reported.
+            json!({"items": [{"uuid": "x-0"}], "count": 51}),
+            json!({"items": [{"uuid": "x-0"}], "count": "51"}),
+            // A count with no items at all.
+            json!({"count": 3}),
+        ] {
+            let (base_url, server, seen) = ips_estate_server(vec![
+                ("/api/v1/ips_signatures/sig-1", custom_signature("CUSTOM-X")),
+                ("/api/v1/ips_profiles", profiles),
+            ])
+            .await;
+            let (manager, _) = ips_manager(&base_url);
+
+            let error = manager
+                .prepare_ips_write(
+                    "alice".to_owned(),
+                    IpsWriteAction::Delete,
+                    IpsWriteFamily::Signature,
+                    None,
+                    Some("sig-1".to_owned()),
+                    Value::Null,
+                    &CancellationToken::new(),
+                )
+                .await
+                .expect_err("a partial read must fail closed")
+                .to_string();
+            assert!(error.contains("could not be shown unreferenced"), "{error}");
+            assert!(writes(&seen).is_empty());
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn a_reference_scan_that_never_ends_refuses_the_delete() {
         // Every list page comes back full, so the scan can only stop at its
         // budget. It must refuse rather than pass on a partial read.
