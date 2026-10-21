@@ -1375,49 +1375,106 @@ impl SdcClient {
             .await
     }
 
-    /// Create one custom IPS signature or IPS profile.
+    /// Collection path of an IPS write family; a rule needs its parent
+    /// profile, a flat family must not get one.
+    fn ips_collection(
+        family: crate::IpsWriteFamily,
+        profile_uuid: Option<&str>,
+    ) -> Result<Vec<&str>, SdcError> {
+        if let Some(profile) = profile_uuid {
+            validate_atom("profile_uuid", profile)?;
+        }
+        family
+            .collection_segments(profile_uuid)
+            .ok_or(SdcError::InvalidInput(
+                "an IPS rule needs its parent profile_uuid; other IPS families take none",
+            ))
+    }
+
+    /// Read one IPS signature, profile, or (with `profile_uuid`) rule by UUID,
+    /// for before-state and drift detection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an identifier is invalid, the family and
+    /// `profile_uuid` do not match, or the SDC request fails.
+    pub async fn get_ips_object(
+        &self,
+        family: crate::IpsWriteFamily,
+        profile_uuid: Option<&str>,
+        uuid: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, SdcError> {
+        validate_atom("uuid", uuid)?;
+        let mut segments = Self::ips_collection(family, profile_uuid)?;
+        segments.push(uuid);
+        self.get(&segments, &[], cancellation).await
+    }
+
+    /// Create one custom IPS signature, IPS profile, or (with
+    /// `profile_uuid`) IPS rule.
     ///
     /// Takes [`crate::IpsWriteFamily`], not [`ResourceKind`], for the same
     /// reason [`Self::create_resource`] takes [`WritableResource`].
     ///
     /// # Errors
     ///
-    /// Returns an error when the body is not a bounded JSON object, or when
-    /// the SDC request fails.
+    /// Returns an error when the body is not a bounded JSON object, the family
+    /// and `profile_uuid` do not match, or the SDC request fails.
     pub async fn create_ips_object(
         &self,
         family: crate::IpsWriteFamily,
+        profile_uuid: Option<&str>,
         body: &Value,
         cancellation: &CancellationToken,
     ) -> Result<Value, SdcError> {
         validate_object_body(body)?;
-        self.send_write(
-            Method::POST,
-            family.collection_segments(),
-            Some(body),
-            cancellation,
-        )
-        .await
+        let segments = Self::ips_collection(family, profile_uuid)?;
+        self.send_write(Method::POST, &segments, Some(body), cancellation)
+            .await
     }
 
-    /// Replace one custom IPS signature or IPS profile by UUID.
+    /// Replace one custom IPS signature, IPS profile, or (with
+    /// `profile_uuid`) IPS rule by UUID.
     ///
     /// # Errors
     ///
-    /// Returns an error when the UUID or body is invalid, or when the SDC
-    /// request fails.
+    /// Returns an error when an identifier or the body is invalid, the family
+    /// and `profile_uuid` do not match, or the SDC request fails.
     pub async fn update_ips_object(
         &self,
         family: crate::IpsWriteFamily,
+        profile_uuid: Option<&str>,
         uuid: &str,
         body: &Value,
         cancellation: &CancellationToken,
     ) -> Result<Value, SdcError> {
         validate_atom("uuid", uuid)?;
         validate_object_body(body)?;
-        let mut segments = family.collection_segments().to_vec();
+        let mut segments = Self::ips_collection(family, profile_uuid)?;
         segments.push(uuid);
         self.send_write(Method::PUT, &segments, Some(body), cancellation)
+            .await
+    }
+
+    /// Delete one custom IPS signature, IPS profile, or (with
+    /// `profile_uuid`) IPS rule by UUID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an identifier is invalid, the family and
+    /// `profile_uuid` do not match, or the SDC request fails.
+    pub async fn delete_ips_object(
+        &self,
+        family: crate::IpsWriteFamily,
+        profile_uuid: Option<&str>,
+        uuid: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, SdcError> {
+        validate_atom("uuid", uuid)?;
+        let mut segments = Self::ips_collection(family, profile_uuid)?;
+        segments.push(uuid);
+        self.send_write(Method::DELETE, &segments, None, cancellation)
             .await
     }
 

@@ -40,7 +40,8 @@ pub use firewall_write::{
 };
 pub use ips_write::{
     IpsApplyResult, IpsPrepareResult, IpsValidationReport, IpsWriteAction, IpsWriteFamily,
-    SdcIpsTransaction, SdcPreparedIpsWrite,
+    SdcIpsTransaction, SdcPreparedIpsWrite, ensure_unreferenced, find_profile_references,
+    find_signature_references, rule_signature_uuids,
 };
 pub use license_write::{
     LicenseApplyResult, LicensePrepareResult, LicenseValidationReport, LicenseWriteOperation,

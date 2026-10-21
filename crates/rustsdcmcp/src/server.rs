@@ -1242,19 +1242,28 @@ pub struct ApplyObjectArgs {
 pub struct PrepareIpsArgs {
     /// Configured tenant alias.
     pub tenant: String,
-    /// Which mutation to plan. Delete is not offered yet (#266).
+    /// Which mutation to plan.
     pub action: IpsWriteAction,
     /// `signature` for a custom IPS signature, group, or anomaly
     /// (`/api/v1/ips_signatures`); `profile` for an IPS profile
-    /// (`/api/v1/ips_profiles`).
+    /// (`/api/v1/ips_profiles`); `rule` for an IPS rule inside a profile
+    /// (`/api/v1/ips_profiles/{profile_uuid}/ips_rules`), which is how
+    /// signatures are added to a profile.
     pub family: IpsWriteFamily,
-    /// Target UUID. Required for update, absent for create.
+    /// Parent IPS profile UUID. Required for `rule`, rejected otherwise.
+    #[serde(default)]
+    pub profile_uuid: Option<String>,
+    /// Target UUID. Required for update and delete, absent for create.
     #[serde(default)]
     pub uuid: Option<String>,
-    /// Full object definition, as the `IpsSignatureInput` or
-    /// `IpsProfileInput` schema describes it. Must include `name`. An update
-    /// replaces the whole object, so send every field to keep.
-    pub body: Value,
+    /// Full object definition, as the `IpsSignatureInput`, `IpsProfileInput`
+    /// or `IPSRuleInput` schema describes it. Required for create and update,
+    /// absent for delete. Must include `name`. A rule also needs
+    /// `ips_signature: [{"uuid": …, "name": …}]` and `then.action` (for
+    /// example `no-action`, `recommended`, `close-client-and-server`). An
+    /// update replaces the whole object, so send every field to keep.
+    #[serde(default)]
+    pub body: Option<Value>,
 }
 
 /// Arguments for applying one approved IPS write.
@@ -3691,7 +3700,7 @@ impl SdcHandler {
 
     #[tool(
         name = "prepare_sdc_ips_write",
-        description = "Plan one custom IPS signature or IPS profile create or update and create a digest-bound change set. This does not write. Predefined signatures (those with an import_id from the signature bundle) are refused. SDC IPS rules carry no zone or address match: scope comes from the firewall rule the profile is attached to. A completed write changes SDC only; nothing reaches a device until a policy using it is deployed."
+        description = "Plan one custom IPS signature, IPS profile, or IPS rule create, update, or delete and create a digest-bound change set. This does not write. Signatures are added to a profile by creating a rule (family `rule`, with `profile_uuid`) that references them; the profile and every referenced signature must already exist. Predefined signatures (those with an import_id or activation_date from the signature bundle) are refused. Deleting a profile still referenced by a firewall rule or global setting, or a signature still referenced by an IPS or exempt rule, is refused with the referrers named. SDC IPS rules carry no zone or address match: scope comes from the firewall rule the profile is attached to. A completed write changes SDC only; nothing reaches a device until a policy using it is deployed."
     )]
     async fn prepare_sdc_ips_write(
         &self,
@@ -3717,8 +3726,9 @@ impl SdcHandler {
                     owner(caller),
                     args.action,
                     args.family,
+                    args.profile_uuid,
                     args.uuid,
-                    args.body,
+                    args.body.unwrap_or(Value::Null),
                     &cancellation,
                 )
                 .await,
@@ -3727,7 +3737,7 @@ impl SdcHandler {
 
     #[tool(
         name = "apply_sdc_ips_write",
-        description = "Apply only an independently approved SDC IPS signature or profile write, refusing it if the target changed since it was planned. This changes SDC only; deploy a policy to reach devices."
+        description = "Apply only an independently approved SDC IPS signature, profile, or rule write, refusing it if the target changed since it was planned. This changes SDC only; deploy a policy to reach devices."
     )]
     async fn apply_sdc_ips_write(
         &self,
@@ -4512,11 +4522,34 @@ mod tests {
         .expect("minimal create");
         assert_eq!(ok.family, IpsWriteFamily::Signature);
         assert!(ok.uuid.is_none());
+        assert!(ok.profile_uuid.is_none());
+
+        let rule: PrepareIpsArgs = serde_json::from_value(serde_json::json!({
+            "tenant": "production",
+            "action": "create",
+            "family": "rule",
+            "profile_uuid": "p-1",
+            "body": {"name": "R", "ips_signature": [{"uuid": "s-1"}], "then": {"action": "no-action"}}
+        }))
+        .expect("rule create");
+        assert_eq!(rule.family, IpsWriteFamily::Rule);
+        assert_eq!(rule.profile_uuid.as_deref(), Some("p-1"));
+
+        // Delete carries no body; whether a body is required is enforced at
+        // prepare, per action, not by the argument schema.
+        let delete: PrepareIpsArgs = serde_json::from_value(serde_json::json!({
+            "tenant": "production",
+            "action": "delete",
+            "family": "profile",
+            "uuid": "p-1"
+        }))
+        .expect("profile delete");
+        assert_eq!(delete.action, IpsWriteAction::Delete);
+        assert!(delete.body.is_none());
 
         for bad in [
-            serde_json::json!({"tenant": "production", "action": "create", "family": "signature"}),
-            serde_json::json!({"tenant": "production", "action": "delete", "family": "signature", "body": {"name": "X"}}),
-            serde_json::json!({"tenant": "production", "action": "create", "family": "rule", "body": {"name": "X"}}),
+            serde_json::json!({"tenant": "production", "action": "remove", "family": "signature", "uuid": "s-1"}),
+            serde_json::json!({"tenant": "production", "action": "create", "family": "exempt_rule", "body": {"name": "X"}}),
             serde_json::json!({"tenant": "production", "action": "create", "family": "profile", "body": {"name": "X"}, "resource": "addresses"}),
         ] {
             assert!(
